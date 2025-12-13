@@ -32,16 +32,27 @@ Command-line usage
 Convert a single bag:
 
     $ python bag_to_lerobot.py \\
-        --bag /path/to/bag_dir \\
-        --contract /path/to/contract.yaml \\
-        --out /path/to/out_root
+        --bag /path/to/my_bag \\
+        --contract /path/to/contract.yaml
+    
+    # Output: out_lerobot/my_bag/
 
-Convert multiple bags:
+Convert multiple bags from a splits folder (containing split0, split1, ...):
 
     $ python bag_to_lerobot.py \\
-        --bags /bag/epi1 /bag/epi2 \\
+        --bags /path/to/session_folder \\
+        --contract /path/to/contract.yaml
+    
+    # Output: out_lerobot/session_folder/
+
+Custom output root:
+
+    $ python bag_to_lerobot.py \\
+        --bags /path/to/session_folder \\
         --contract /path/to/contract.yaml \\
-        --out /path/to/out_root
+        --out /custom/output/root
+    
+    # Output: /custom/output/root/session_folder/
 
 Options of note:
 
@@ -85,7 +96,9 @@ import yaml
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
-
+import tempfile 
+import os 
+from pathlib import Path
 # ---- LeRobot
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -102,9 +115,8 @@ from rosetta.common.contract_utils import (
     stamp_from_header_ns,
     zero_pad as make_zero_pad,  # alias to avoid name clash with dict var
 )
+import rosetta.common.decoders
 
-# Import decoders to register them
-import rosetta.common.decoders  # noqa: F401
 
 # ---------------------------------------------------------------------------
 
@@ -129,6 +141,8 @@ class _Stream:
     ros_type: str
     ts: List[int]
     val: List[Any]
+    is_image: bool = False  #Nuevo
+    temp_dir: Optional[Path] = None #Nuevo
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +161,18 @@ def _topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
     """Build a `{topic: type}` map from a rosbag2 reader."""
     return {t.name: t.type for t in reader.get_all_topics_and_types()}
 
+def _save_image_to_disk(img_array: np.ndarray, temp_dir: Path, idx: int)->str: #Nuevo
+    filepath = temp_dir / f"img_{idx:08d}.npy"
+    np.save(filepath, img_array)
+    return str(filepath)
+
+def _load_image_from_disk(filepath: str) -> np.ndarray:  #Nuevo
+    return np.load(filepath)
 
 def _plan_streams(
     specs: Iterable[Any],
     tmap: Dict[str, str],
+    temp_root: Path,
 ) -> Tuple[Dict[str, _Stream], Dict[str, List[str]]]:
     """Plan `_Stream` buffers for contract specs and build a topic dispatch index.
 
@@ -200,15 +222,103 @@ def _plan_streams(
         else:
             unique_key = sv.key
             
-        streams[unique_key] = _Stream(spec=sv, ros_type=rt, ts=[], val=[])
+        is_image = "observation.image" in sv.key
+
+        streams[unique_key] = _Stream(spec=sv, ros_type=rt, ts=[], val=[], is_image=is_image, temp_dir=None)
         by_topic.setdefault(sv.topic, []).append(unique_key)
-    if not streams:
-        raise RuntimeError("No contract topics found in bag.")
+
+        
+        if not streams:
+            raise RuntimeError("No contract topics found in bag.")
+        
+        if is_image:
+            temp_dir = temp_root / unique_key.replace(".","_").replace("/","_")
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            streams[unique_key].temp_dir = temp_dir
+            print(f"Image stream {unique_key} will use a temp storage {temp_dir}")
+
     return streams, by_topic
 
 
-# ---------------------------------------------------------------------------
+def _detect_image_shapes_from_bag(
+    bag_dir: Path,
+    specs: List[Any],
+) -> Dict[str, Tuple[int, int, int]]:
+    """Pre-scan a bag to detect actual image shapes.
+    
+    Parameters
+    ----------
+    bag_dir : Path
+        Path to the bag directory to scan.
+    specs : list
+        List of SpecView objects from the contract.
+        
+    Returns
+    -------
+    dict[str, tuple[int, int, int]]
+        Mapping from feature key to detected (H, W, C) shape.
+    """
+    detected_shapes: Dict[str, Tuple[int, int, int]] = {}
+    
+    # Find image specs
+    image_specs = [sv for sv in specs if sv.image_resize is not None]
+    if not image_specs:
+        return detected_shapes
+    
+    # Build topic -> spec mapping
+    topic_to_spec: Dict[str, Any] = {}
+    for sv in image_specs:
+        topic_to_spec[sv.topic] = sv
+    
+    try:
+        meta = _read_yaml(bag_dir / "metadata.yaml")
+        info = meta.get("rosbag2_bagfile_information") or {}
+        storage = info.get("storage_identifier") or "mcap"
+        
+        reader = rosbag2_py.SequentialReader()
+        reader.open(
+            rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id=storage),
+            rosbag2_py.ConverterOptions(
+                input_serialization_format="cdr",
+                output_serialization_format="cdr",
+            ),
+        )
+        
+        tmap = _topic_type_map(reader)
+        topics_found = set()
+        
+        # Scan until we've found one image from each topic
+        while reader.has_next() and len(topics_found) < len(topic_to_spec):
+            topic, data, _ = reader.read_next()
+            
+            if topic not in topic_to_spec or topic in topics_found:
+                continue
+                
+            sv = topic_to_spec[topic]
+            ros_type = sv.ros_type or tmap.get(topic)
+            if not ros_type:
+                continue
+                
+            try:
+                msg = deserialize_message(data, get_message(ros_type))
+                val = decode_value(ros_type, msg, sv)
+                
+                if val is not None and isinstance(val, np.ndarray) and len(val.shape) == 3:
+                    h, w, c = val.shape
+                    detected_shapes[sv.key] = (h, w, c)
+                    topics_found.add(topic)
+                    print(f"[Auto-detect] {sv.key}: detected shape ({h}, {w}, {c})")
+            except Exception as e:
+                print(f"[WARN] Could not decode {topic} for shape detection: {e}")
+                continue
+                
+    except Exception as e:
+        print(f"[WARN] Could not pre-scan bag for image shapes: {e}")
+    
+    return detected_shapes
 
+
+# ---------------------------------------------------------------------------
 
 def export_bags_to_lerobot(
     bag_dirs: List[Path],
@@ -216,13 +326,14 @@ def export_bags_to_lerobot(
     out_root: Path,
     repo_id: str = "rosbag_v30",
     use_videos: bool = True,
-    image_writer_threads: int = 4,
+    image_writer_threads: int = 6,
     image_writer_processes: int = 0,
     chunk_size: int = 1000,
     data_mb: int = 100,
     video_mb: int = 500,
-    timestamp_source: str = "contract",  # 'contract' | 'receive' | 'header'
+    timestamp_source: str = "contract",  # 'contract' | 'receive' | 'header' |
 ) -> None:
+
     """Convert bag directories into a LeRobot v3 dataset under `out_root`.
 
     Parameters
@@ -251,8 +362,7 @@ def export_bags_to_lerobot(
         Target video file size in MB per chunk.
     timestamp_source : {"contract","receive","header"}, default "contract"
         Timestamp selection policy per decoded message:
-        - "contract": Use bag time, unless spec.stamp_src == "header"
-                      and a valid header stamp exists.
+        - "contract": Use bag time, unless spec.stamp_src == "header" or spec.stamp_src == "foxglove"
         - "receive":  Always use bag receive time.
         - "header":   Prefer header stamp; fall back to bag receive time.
 
@@ -277,12 +387,21 @@ def export_bags_to_lerobot(
     step_ns = int(round(1e9 / fps))
     specs = list(iter_specs(contract))
 
+    # Pre-scan first bag to detect actual image shapes
+    detected_shapes: Dict[str, Tuple[int, int, int]] = {}
+    if bag_dirs:
+        print("[Auto-detect] Scanning first bag to detect image shapes...")
+        detected_shapes = _detect_image_shapes_from_bag(bag_dirs[0], specs)
+        if detected_shapes:
+            print(f"[Auto-detect] Detected shapes for {len(detected_shapes)} image streams")
+
     # Features (also detect first image key as anchor)
     features: Dict[str, Dict[str, Any]] = {}
     primary_image_key: Optional[str] = None
     state_specs = []  # Track multiple observation.state specs
     action_specs_by_key: Dict[str, List[Any]] = {}  # Track multiple action specs by key
     
+    #print("specs are", specs)
     for sv in specs:
         # Handle multiple observation.state specs
         if sv.key == "observation.state":
@@ -314,6 +433,15 @@ def export_bags_to_lerobot(
                 # Update the shape to reflect 3 channels
                 ft["shape"] = list(ft["shape"])
                 ft["shape"][-1] = 3
+            
+            # Override shape with detected shape if available (for images)
+            if is_img and k in detected_shapes:
+                detected_h, detected_w, detected_c = detected_shapes[k]
+                contract_shape = tuple(ft["shape"])
+                if contract_shape != (detected_h, detected_w, detected_c):
+                    print(f"[Auto-detect] {k}: overriding contract shape {contract_shape} -> ({detected_h}, {detected_w}, {detected_c})")
+                    ft["shape"] = (detected_h, detected_w, detected_c)
+            
             features[k] = ft
         if is_img and primary_image_key is None:
             primary_image_key = sv.key
@@ -352,7 +480,7 @@ def export_bags_to_lerobot(
             sv = action_specs[0]
             k, ft, _ = feature_from_spec(sv, use_videos)
             features[k] = ft
-    
+            
     # Mark depth videos in features metadata before dataset creation
     for key, feature in features.items():
         if key.endswith(".depth") and feature.get("dtype") == "video":
@@ -399,6 +527,7 @@ def export_bags_to_lerobot(
     for epi_idx, bag_dir in enumerate(bag_dirs):
         print(f"[Episode {epi_idx}] {bag_dir}")
 
+        temp_episode_dir = Path(tempfile.mkdtemp(prefix=f"lerobot_images_ep{epi_idx}_")) #Nuevo
         try:
             meta = _read_yaml(bag_dir / "metadata.yaml")
             info = meta.get("rosbag2_bagfile_information") or {}
@@ -425,11 +554,10 @@ def export_bags_to_lerobot(
             continue
 
         tmap = _topic_type_map(reader)
-        print(f"tmap: {tmap}")
-
-        # Plan once - handle multiple observation.state specs and action specs
-        streams, by_topic = _plan_streams(specs, tmap)
         
+        # Plan once - handle multiple observation.state specs and action specs
+        streams, by_topic = _plan_streams(specs, tmap, temp_episode_dir)
+        image_counters = {k: 0 for k, st in streams.items() if st.is_image}
         # Create consolidated observation.state stream if we have multiple state specs
         if state_specs:
             # Find all observation.state streams
@@ -438,8 +566,7 @@ def export_bags_to_lerobot(
                 # Create a consolidated stream that will concatenate the data
                 # We'll handle this in the frame processing
                 pass
-        print(f"streams: {streams}")
-
+        
         # Counters for light diagnostics
         decoded_msgs = 0
 
@@ -452,29 +579,42 @@ def export_bags_to_lerobot(
                 st = streams[key]
                 msg = deserialize_message(data, get_message(st.ros_type))
                 sv = st.spec
-
+                
+                
                 # Timestamp selection policy
                 if timestamp_source == "receive":
                     ts_sel = int(bag_ns)
                 elif timestamp_source == "header":
-                    ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
+                    ts_sel = stamp_from_header_ns(msg) or int(bag_ns)    
                 else:  # 'contract' (per-spec stamp_src)
-                    ts_sel = int(bag_ns)
-                    if sv.stamp_src == "header":
-                        hdr = stamp_from_header_ns(msg)
-                        if hdr is not None:
-                            ts_sel = int(hdr)
+                    if sv.stamp_src == "foxglove": #for compressed videos
+                        time = msg.timestamp
+                        ts_sel = int(time.sec) * 1_000_000_000 + int(time.nanosec)
+                    else:
+                        ts_sel = stamp_from_header_ns(msg) 
+                
 
                 val = decode_value(st.ros_type, msg, sv)
+               
 
                 if val is not None:
                     st.ts.append(ts_sel)
-                    st.val.append(val)
-                    decoded_msgs += 1
 
+                    if st.is_image:
+                        img_idx = image_counters[key]
+                        filepath = _save_image_to_disk(val, st.temp_dir, img_idx)
+                        st.val.append(filepath)
+                        image_counters[key] +=1
+                    else: 
+                        st.val.append(val)
+                    decoded_msgs += 1
+                else: 
+                    print("not valid", st.ros_type)
         if decoded_msgs == 0:
             raise RuntimeError(f"No usable messages in {bag_dir} (none decoded).")
-
+        
+        print("Finished decoding msgs")
+        
         # Choose anchor + duration
         valid_ts = [
             np.asarray(st.ts, dtype=np.int64) for st in streams.values() if st.ts
@@ -504,11 +644,10 @@ def export_bags_to_lerobot(
             print(
                 "Metadata duration disagrees with observed duration. Using observed duration"
             )
-
         # Ticks
         n_ticks = int(dur_ns // step_ns) + 1
         ticks_ns = start_ns + np.arange(n_ticks, dtype=np.int64) * step_ns
-
+        
 
         # Resample onto ticks
         resampled: Dict[str, List[Any]] = {}
@@ -521,11 +660,17 @@ def export_bags_to_lerobot(
             resampled[key] = resample(
                 pol, ts, st.val, ticks_ns, step_ns, st.spec.asof_tol_ms
             )
+            
+        safe_window = 10
+        active_images = {}
 
+        print("Resampling done")
         # Write frames
+
         for i in range(n_ticks):
             frame: Dict[str, Any] = {}
             
+
             # Handle consolidated observation.state by concatenating multiple state streams first
             if "observation.state" in features and state_specs:
                 # Concatenate all observation.state values from different topics
@@ -546,25 +691,26 @@ def export_bags_to_lerobot(
                     frame["observation.state"] = zero_pad_map["observation.state"]
             
             # Handle consolidated action specs by concatenating multiple action streams
+            # Handle action specs (one or many) by concatenating streams
             for action_key, action_specs in action_specs_by_key.items():
-                if len(action_specs) > 1 and action_key in features:
-                    # Concatenate all action values from different topics
-                    action_values = []
-                    for sv in action_specs:
-                        unique_key = f"{sv.key}_{sv.topic.replace('/', '_')}"
-                        stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
-                        if stream_val is not None:
-                            val_array = np.asarray(stream_val, dtype=np.float32).reshape(-1)
-                            action_values.append(val_array)
-                    
-                    if action_values:
-                        # Concatenate all action values
-                        concatenated_action = np.concatenate(action_values)
-                        frame[action_key] = concatenated_action
-                    else:
-                        # Use zero padding if no action values available
-                        frame[action_key] = zero_pad_map[action_key]
-            
+                if action_key not in features:
+                    continue
+
+                action_values = []
+                for sv in action_specs:
+                    unique_key = f"{sv.key}_{sv.topic.replace('/', '_')}"
+                    stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
+                    if stream_val is not None:
+                        val_array = np.asarray(stream_val, dtype=np.float32).reshape(-1)
+                        action_values.append(val_array)
+
+                if action_values:
+                    concatenated_action = np.concatenate(action_values)
+                    frame[action_key] = concatenated_action
+                else:
+                    frame[action_key] = zero_pad_map[action_key]
+
+                        
             # Process all other features
             for name in write_keys:
                 # Skip observation.state as it's handled above
@@ -572,7 +718,7 @@ def export_bags_to_lerobot(
                     continue
                 
                 # Skip consolidated actions as they're handled above
-                if name in action_specs_by_key and len(action_specs_by_key[name]) > 1: #TODO: I think this can just be if name == "action"
+                if name in action_specs_by_key: 
                     continue
                     
                 ft = features[name]
@@ -583,12 +729,34 @@ def export_bags_to_lerobot(
                     frame[name] = zero_pad_map[name]
                     continue
 
-                if dtype in ("video", "image"):
-                    arr = np.asarray(val)
+                if dtype in ("video", "image"): 
+
+                    if isinstance(val, str):
+                        temp_path = val
+                        arr = _load_image_from_disk(val)
+                    else:
+                        temp_path = None
+                        arr = np.asarray(val)
                     # Ensure deterministic storage; lerobot loaders will map back to float [0,1]
                     if arr.dtype != np.uint8:
                         arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
                     frame[name] = arr
+
+                    # Clean up
+                    if temp_path:
+                        active_images.setdefault(name, []).append(temp_path)
+
+                        idx = int(os.path.basename(temp_path).split("_")[-1].split(".")[0])
+                        # delete image from 0 to N - safe_window
+                        for old_path in list(active_images[name]):
+                            old_idx = int(os.path.basename(old_path).split("_")[-1].split(".")[0])
+                            if old_idx < idx - safe_window:
+                                try:
+                                    os.remove(old_path)
+                                except FileNotFoundError:
+                                    pass
+                                active_images[name].remove(old_path)
+                    
 
                 elif dtype in ("float32", "float64"):
                     tgt_dt = np.float32 if dtype == "float32" else np.float64
@@ -599,7 +767,7 @@ def export_bags_to_lerobot(
                         fixed[: min(exp, arr.shape[0])] = arr[: min(exp, arr.shape[0])]
                         arr = fixed
                     frame[name] = arr
-
+                    
                 elif dtype == "string":
                     frame[name] = str(val)
 
@@ -638,14 +806,14 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser("ROS2 bag → LeRobot v3 (using rosetta.common.*)")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--bag", help="Path to a single bag directory (episode)")
-    g.add_argument("--bags", nargs="+", help="Paths to multiple bag directories")
+    g.add_argument("--bags", help="Path to folder containing split0, split1, ... subfolders")
     ap.add_argument("--contract", required=True, help="Path to YAML contract")
-    ap.add_argument("--out", required=True, help="Output dataset root")
+    ap.add_argument("--out", default="out_lerobot", help="Output root directory (default: out_lerobot)")
     ap.add_argument("--repo-id", default="rosbag_v30", help="repo_id metadata")
     ap.add_argument(
         "--no-videos", action="store_true", help="Store images instead of videos"
     )
-    ap.add_argument("--image-threads", type=int, default=4, help="Image writer threads")
+    ap.add_argument("--image-threads", type=int, default=6, help="Image writer threads")
     ap.add_argument(
         "--image-processes", type=int, default=0, help="Image writer processes"
     )
@@ -664,14 +832,75 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def _discover_split_folders(parent_dir: Path) -> List[Path]:
+    """Discover split folders (split0, split1, ...) in the given directory.
+    
+    Parameters
+    ----------
+    parent_dir : Path
+        Parent directory containing split* subfolders.
+        
+    Returns
+    -------
+    list[Path]
+        Sorted list of split folder paths.
+        
+    Raises
+    ------
+    ValueError
+        If no split folders are found.
+    """
+    import re
+    
+    split_pattern = re.compile(r'^split(\d+)$')
+    splits = []
+    
+    for child in parent_dir.iterdir():
+        if child.is_dir():
+            match = split_pattern.match(child.name)
+            if match:
+                split_num = int(match.group(1))
+                splits.append((split_num, child))
+    
+    if not splits:
+        raise ValueError(f"No split folders (split0, split1, ...) found in {parent_dir}")
+    
+    # Sort by split number
+    splits.sort(key=lambda x: x[0])
+    sorted_paths = [p for _, p in splits]
+    
+    print(f"[Splits] Found {len(sorted_paths)} splits in {parent_dir}:")
+    for p in sorted_paths:
+        print(f"  - {p.name}")
+    
+    return sorted_paths
+
+
 def main() -> None:
     """CLI entry point for batch conversion of ROS 2 bags to LeRobot."""
     args = parse_args()
-    bag_dirs = [Path(args.bag)] if args.bag else [Path(p) for p in args.bags]
+    
+    if args.bag:
+        input_path = Path(args.bag)
+        bag_dirs = [input_path]
+    else:
+        # Discover split folders from the provided directory
+        input_path = Path(args.bags)
+        if not input_path.exists():
+            raise FileNotFoundError(f"Splits folder not found: {input_path}")
+        bag_dirs = _discover_split_folders(input_path)
+    
+    # Build output path: out_root/input_folder_name
+    out_root = Path(args.out)
+    input_folder_name = input_path.name
+    final_out_path = out_root / input_folder_name
+    
+    print(f"[Output] Dataset will be saved to: {final_out_path}")
+    
     export_bags_to_lerobot(
         bag_dirs=bag_dirs,
         contract_path=Path(args.contract),
-        out_root=Path(args.out),
+        out_root=final_out_path,
         repo_id=args.repo_id,
         use_videos=not args.no_videos,
         image_writer_threads=args.image_threads,
