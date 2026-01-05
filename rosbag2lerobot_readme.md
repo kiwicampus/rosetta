@@ -33,14 +33,29 @@ Verify after install (optional): `which lerobot-train` to confirm CLI is on `PAT
 
 To test the tool you need a rosbag with its corresponding metadata.yaml file. Make sure they are both stored in the same folder. 
 
-Single episode: 
+Convert a single bag:
 
-`python3 path/to/bag_to_lerobot.py --bag /path/to/bag/folder --contract /path/to/contracts/fomo_test.yaml --out /path/to/outputfolder`
+    `python bag_to_lerobot.py \\
+        --bag /path/to/my_bag \\
+        --contract /path/to/contract.yaml`
+    
+    # Output: out_lerobot/my_bag/
 
-More than one episode: 
+Convert multiple bags from a splits folder (containing split0, split1, ...):
 
-`python3 path/to/bag_to_lerobot.py --bags /path/to/episodes/epi1  /path/to/episodes/epi1 /path/to/episodes/epi2 /path/to/episodes/epi3  --contract /path/to/contracts/fomo_test.yaml --out /path/to/outputfolder`
+    `python bag_to_lerobot.py \\
+        --bags /path/to/session_folder \\
+        --contract /path/to/contract.yaml`
+    
+    # Output: out_lerobot/session_folder/
 
+Custom output root:
+
+    `python bag_to_lerobot.py \\
+        --bags /path/to/session_folder \\
+        --contract /path/to/contract.yaml \\
+        --out /custom/output/root`
+    
 Each bag folder must have an mcap file with its metadata file. In case you trimmed a rosbag and want to obtain a metadata.yaml for it, run: `ros2 bag reindex /mcap_folder/ ` (the mcap file inside mcap_folder/ must be called data_0.mcap)
 ---
 

@@ -468,13 +468,10 @@ def resample_closest(ts_ns: np.ndarray, vals: List[Any], ticks_ns: np.ndarray) -
         i = np.searchsorted(ts_ns, t, side='right')
 
         if i == 0:
-            # All timestamps are to the right → closest is the first
             closest_idx = 0
         elif i == n:
-            # All timestamps are to the left → closest is the last
             closest_idx = n - 1
         else:
-            # There is a timestamp on both sides → pick the closest one
             prev_diff = t - ts_ns[i - 1]
             next_diff = ts_ns[i] - t
             closest_idx = i - 1 if prev_diff <= next_diff else i

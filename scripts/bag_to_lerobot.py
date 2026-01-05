@@ -115,8 +115,9 @@ from rosetta.common.contract_utils import (
     stamp_from_header_ns,
     zero_pad as make_zero_pad,  # alias to avoid name clash with dict var
 )
-import rosetta.common.decoders
 
+# Import decoders to register them
+import rosetta.common.decoders  # noqa: F401
 
 # ---------------------------------------------------------------------------
 
@@ -141,8 +142,8 @@ class _Stream:
     ros_type: str
     ts: List[int]
     val: List[Any]
-    is_image: bool = False  #Nuevo
-    temp_dir: Optional[Path] = None #Nuevo
+    is_image: bool = False  
+    temp_dir: Optional[Path] = None 
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +245,7 @@ def _detect_image_shapes_from_bag(
     bag_dir: Path,
     specs: List[Any],
 ) -> Dict[str, Tuple[int, int, int]]:
-    """Pre-scan a bag to detect actual image shapes.
+    """Pre-scan a bag to detect actual image shapes. To avoid errors when checking image size.
     
     Parameters
     ----------
@@ -401,7 +402,6 @@ def export_bags_to_lerobot(
     state_specs = []  # Track multiple observation.state specs
     action_specs_by_key: Dict[str, List[Any]] = {}  # Track multiple action specs by key
     
-    #print("specs are", specs)
     for sv in specs:
         # Handle multiple observation.state specs
         if sv.key == "observation.state":
@@ -527,7 +527,7 @@ def export_bags_to_lerobot(
     for epi_idx, bag_dir in enumerate(bag_dirs):
         print(f"[Episode {epi_idx}] {bag_dir}")
 
-        temp_episode_dir = Path(tempfile.mkdtemp(prefix=f"lerobot_images_ep{epi_idx}_")) #Nuevo
+        temp_episode_dir = Path(tempfile.mkdtemp(prefix=f"lerobot_images_ep{epi_idx}_")) 
         try:
             meta = _read_yaml(bag_dir / "metadata.yaml")
             info = meta.get("rosbag2_bagfile_information") or {}
@@ -580,23 +580,20 @@ def export_bags_to_lerobot(
                 msg = deserialize_message(data, get_message(st.ros_type))
                 sv = st.spec
                 
-                
                 # Timestamp selection policy
                 if timestamp_source == "receive":
                     ts_sel = int(bag_ns)
                 elif timestamp_source == "header":
-                    ts_sel = stamp_from_header_ns(msg) or int(bag_ns)    
+                    ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
                 else:  # 'contract' (per-spec stamp_src)
                     if sv.stamp_src == "foxglove": #for compressed videos
                         time = msg.timestamp
                         ts_sel = int(time.sec) * 1_000_000_000 + int(time.nanosec)
                     else:
                         ts_sel = stamp_from_header_ns(msg) 
-                
 
                 val = decode_value(st.ros_type, msg, sv)
                
-
                 if val is not None:
                     st.ts.append(ts_sel)
 
@@ -612,8 +609,6 @@ def export_bags_to_lerobot(
                     print("not valid", st.ros_type)
         if decoded_msgs == 0:
             raise RuntimeError(f"No usable messages in {bag_dir} (none decoded).")
-        
-        print("Finished decoding msgs")
         
         # Choose anchor + duration
         valid_ts = [
@@ -646,8 +641,7 @@ def export_bags_to_lerobot(
             )
         # Ticks
         n_ticks = int(dur_ns // step_ns) + 1
-        ticks_ns = start_ns + np.arange(n_ticks, dtype=np.int64) * step_ns
-        
+        ticks_ns = start_ns + np.arange(n_ticks, dtype=np.int64) * step_ns        
 
         # Resample onto ticks
         resampled: Dict[str, List[Any]] = {}
@@ -688,7 +682,7 @@ def export_bags_to_lerobot(
                         state_values.append(zero_pad)
                 
                 if state_values:
-                    # Concatenate all state values (including zero-padded ones)
+                    # Concatenate all state values
                     concatenated_state = np.concatenate(state_values)
                     frame["observation.state"] = concatenated_state
                 else:
@@ -696,7 +690,6 @@ def export_bags_to_lerobot(
                     frame["observation.state"] = zero_pad_map["observation.state"]
             
             # Handle consolidated action specs by concatenating multiple action streams
-            # Handle action specs (one or many) by concatenating streams
             for action_key, action_specs in action_specs_by_key.items():
                 if action_key not in features:
                     continue
