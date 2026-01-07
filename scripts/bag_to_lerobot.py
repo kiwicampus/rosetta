@@ -99,6 +99,8 @@ from rosidl_runtime_py.utilities import get_message
 import tempfile 
 import os 
 from pathlib import Path
+from mcap.reader import make_reader
+import bisect
 # ---- LeRobot
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -136,6 +138,9 @@ class _Stream:
         Per-message timestamps in nanoseconds (selected by policy).
     val : list[Any]
         Decoded values in contract-native form (e.g., HWC arrays for images).
+        For images, this stores the log_time (MCAP log time) for direct decoding.
+    log_times : list[int]
+        For images: MCAP log times corresponding to each timestamp.
     """
 
     spec: Any
@@ -143,7 +148,12 @@ class _Stream:
     ts: List[int]
     val: List[Any]
     is_image: bool = False  
-    temp_dir: Optional[Path] = None 
+    temp_dir: Optional[Path] = None
+    log_times: List[int] = None
+    
+    def __post_init__(self):
+        if self.log_times is None:
+            self.log_times = [] 
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +179,143 @@ def _save_image_to_disk(img_array: np.ndarray, temp_dir: Path, idx: int)->str: #
 
 def _load_image_from_disk(filepath: str) -> np.ndarray:  #Nuevo
     return np.load(filepath)
+
+# Key: (bag_dir, topic, timestamp) -> decoded frame
+_frame_cache: Dict[Tuple[Path, str, int], Optional[np.ndarray]] = {}
+# Track the last decoded timestamp per (bag_dir, topic) to continue sequential decoding
+_last_decoded_ts: Dict[Tuple[Path, str], int] = {}
+
+def _load_frame_from_mcap(
+    bag_dir: Path,
+    topic: str,
+    target_log_time: int,  # Direct log_time from resampling, no need to search
+    stream: _Stream,
+    header_times: List[int],
+    log_times: List[int]
+) -> Optional[np.ndarray]:
+    """
+    Decode a single frame from MCAP using the log_time directly.
+    Similar to bag_reader.load_frame_at but adapted for bag_to_lerobot.
+    
+    For H.264 decoding, we need to decode sequentially to maintain decoder context.
+    We cache decoded frames and continue from the last decoded position.
+    
+    Parameters
+    ----------
+    bag_dir : Path
+        Path to the bag directory
+    topic : str
+        Topic name for the image
+    target_log_time : int
+        Target log_time in nanoseconds (from resampling, no need to search)
+    stream : _Stream
+        Stream object containing spec and ros_type
+    header_times : List[int]
+        List of header timestamps (for cache key)
+    log_times : List[int]
+        List of log times (for finding start position)
+        
+    Returns
+    -------
+    np.ndarray or None
+        Decoded image array or None if not found
+    """
+    if not header_times or not log_times:
+        print("[WARN] No timestamps available")
+        return None
+    
+    # Find corresponding header_time for this log_time
+    log_idx = log_times.index(target_log_time)
+    target_header_ts = header_times[log_idx]
+    
+    cache_key = (bag_dir, topic, target_header_ts)
+    if cache_key in _frame_cache:
+        return _frame_cache[cache_key]
+    
+    stream_key = (bag_dir, topic)
+    
+    # Determine where to start decoding
+    # Continue from previously decoded frames or at the beginning
+    if stream_key in _last_decoded_ts:
+        start_log_time = _last_decoded_ts[stream_key]
+        # If target is before last decoded, reset and start from beginning
+        if target_log_time < start_log_time:
+            # Reset decoder state for this topic to start fresh
+            from rosetta.common.decoders import _decoder_state
+            if topic in _decoder_state:
+                del _decoder_state[topic]
+            start_log_time = log_times[0] if log_times else 0
+            _last_decoded_ts[stream_key] = start_log_time
+    else:
+        # First time decoding this stream - start from beginning
+        start_log_time = log_times[0] if log_times else 0
+        _last_decoded_ts[stream_key] = start_log_time
+    
+    # Decode from MCAP
+    try:
+        mcap_files = list(bag_dir.glob("*.mcap"))
+        if not mcap_files:
+            print(f"[WARN] MCAP file not found in {bag_dir}")
+            _frame_cache[cache_key] = None
+            return None
+        
+        mcap_path = mcap_files[0]
+        if not mcap_path.exists():
+            print(f"[WARN] MCAP file not found: {mcap_path}")
+            _frame_cache[cache_key] = None
+            return None
+        
+        # Decode sequentially from start_log_time to target_log_time
+        # This ensures the H.264 decoder has proper context
+        target_val = None
+        
+        with open(mcap_path, "rb") as f:
+            reader = make_reader(f)
+            
+            for schema, channel, message in reader.iter_messages(
+                topics=[topic],
+                start_time=start_log_time
+            ):
+                msg = deserialize_message(message.data, get_message(stream.ros_type))
+                
+                # Get message timestamp and log_time
+                msg_header_ts = int(msg.timestamp.sec) * 1_000_000_000 + int(msg.timestamp.nanosec)
+                msg_log_time = message.log_time
+                
+                # Decode all frames sequentially (needed for H.264 context)
+                # Cache all decoded frames to avoid re-decoding
+                frame_cache_key = (bag_dir, topic, msg_header_ts)
+                if frame_cache_key in _frame_cache:
+                    val = _frame_cache[frame_cache_key]
+                else:
+                    val = decode_value(stream.ros_type, msg, stream.spec)
+                    # Cache the decoded frame
+                    _frame_cache[frame_cache_key] = val
+                    # Update last decoded log_time
+                    _last_decoded_ts[stream_key] = msg_log_time
+                
+                # Check if this is the target frame (match by log_time)
+                if abs(msg_log_time - target_log_time) < 10_000_000:  # 10ms tolerance for log_time
+                    if val is not None:
+                        target_val = val
+                        break  # Found target, stop
+                
+                # Stop if we've passed the target by more than tolerance
+                if msg_log_time > target_log_time + 10_000_000:
+                    break
+            
+            # Cache the result
+            _frame_cache[cache_key] = target_val
+            return target_val
+            
+    except Exception as e:
+        print(f"[WARN] Failed to decode frame at log_time {target_log_time} from MCAP: {e}")
+        import traceback
+        traceback.print_exc()
+        _frame_cache[cache_key] = None
+        return None
+    
+    return None
 
 def _plan_streams(
     specs: Iterable[Any],
@@ -231,12 +378,6 @@ def _plan_streams(
         
         if not streams:
             raise RuntimeError("No contract topics found in bag.")
-        
-        if is_image:
-            temp_dir = temp_root / unique_key.replace(".","_").replace("/","_")
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            streams[unique_key].temp_dir = temp_dir
-            print(f"Image stream {unique_key} will use a temp storage {temp_dir}")
 
     return streams, by_topic
 
@@ -557,7 +698,7 @@ def export_bags_to_lerobot(
         
         # Plan once - handle multiple observation.state specs and action specs
         streams, by_topic = _plan_streams(specs, tmap, temp_episode_dir)
-        image_counters = {k: 0 for k, st in streams.items() if st.is_image}
+        
         # Create consolidated observation.state stream if we have multiple state specs
         if state_specs:
             # Find all observation.state streams
@@ -569,44 +710,63 @@ def export_bags_to_lerobot(
         
         # Counters for light diagnostics
         decoded_msgs = 0
+        message_counter = 0
 
-        # Decode single pass
+        # Extract timestamps only for images, decode non-images immediately
         while reader.has_next():
             topic, data, bag_ns = reader.read_next()
+            message_counter += 1
             if topic not in by_topic:
                 continue
             for key in by_topic[topic]:
                 st = streams[key]
-                msg = deserialize_message(data, get_message(st.ros_type))
                 sv = st.spec
                 
-                # Timestamp selection policy
-                if timestamp_source == "receive":
-                    ts_sel = int(bag_ns)
-                elif timestamp_source == "header":
-                    ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
-                else:  # 'contract' (per-spec stamp_src)
-                    if sv.stamp_src == "foxglove": #for compressed videos
-                        time = msg.timestamp
-                        ts_sel = int(time.sec) * 1_000_000_000 + int(time.nanosec)
-                    else:
-                        ts_sel = stamp_from_header_ns(msg) 
-
-                val = decode_value(st.ros_type, msg, sv)
-               
-                if val is not None:
-                    st.ts.append(ts_sel)
-
-                    if st.is_image:
-                        img_idx = image_counters[key]
-                        filepath = _save_image_to_disk(val, st.temp_dir, img_idx)
-                        st.val.append(filepath)
-                        image_counters[key] +=1
-                    else: 
-                        st.val.append(val)
+                if st.is_image:
+                    # For images: store header_time and log_time (bag_ns as approximation)
+                    msg = deserialize_message(data, get_message(st.ros_type))
+                    
+                    # Timestamp selection policy (header_time for resampling)
+                    if timestamp_source == "receive":
+                        ts_sel = int(bag_ns)
+                    elif timestamp_source == "header":
+                        ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
+                    else:  # 'contract' (per-spec stamp_src)
+                        if sv.stamp_src == "foxglove": #for compressed videos
+                            time = msg.timestamp
+                            ts_sel = int(time.sec) * 1_000_000_000 + int(time.nanosec)
+                        else:
+                            ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
+                    
+                    # Store header_time for resampling and log_time (bag_ns) for direct MCAP seeking
+                    log_time = int(bag_ns)  # Use bag_ns as approximation of MCAP log_time
+                    st.ts.append(ts_sel)  # Header timestamp for resampling
+                    st.val.append(log_time)  # Store log_time as value - resampling will select which log_time to use
+                    st.log_times.append(log_time)  # store in log_times for direct lookup
                     decoded_msgs += 1
-                else: 
-                    print("not valid", st.ros_type)
+                else:
+                    msg = deserialize_message(data, get_message(st.ros_type))
+                    
+                    # Timestamp selection policy
+                    if timestamp_source == "receive":
+                        ts_sel = int(bag_ns)
+                    elif timestamp_source == "header":
+                        ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
+                    else:  # 'contract' (per-spec stamp_src)
+                        if sv.stamp_src == "foxglove": #for compressed videos
+                            time = msg.timestamp
+                            ts_sel = int(time.sec) * 1_000_000_000 + int(time.nanosec)
+                        else:
+                            ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
+                    
+                    val = decode_value(st.ros_type, msg, sv)
+                   
+                    if val is not None:
+                        st.ts.append(ts_sel)
+                        st.val.append(val)
+                        decoded_msgs += 1
+                    else: 
+                        print("not valid", st.ros_type)
         if decoded_msgs == 0:
             raise RuntimeError(f"No usable messages in {bag_dir} (none decoded).")
         
@@ -728,32 +888,28 @@ def export_bags_to_lerobot(
                     continue
 
                 if dtype in ("video", "image"): 
-
-                    if isinstance(val, str):
-                        temp_path = val
-                        arr = _load_image_from_disk(val)
-                    else:
-                        temp_path = None
-                        arr = np.asarray(val)
+                    # val contains the log_time selected by resampling
+                    resampled_log_time = val
+                    
+                    st = streams[name]
+                    # Decode from MCAP using the resampled log_time directly 
+                    arr = _load_frame_from_mcap(
+                        bag_dir=bag_dir,
+                        topic=st.spec.topic,
+                        target_log_time=int(resampled_log_time),
+                        stream=st,
+                        header_times=st.ts,
+                        log_times=st.log_times
+                    )
+                    if arr is None:
+                        # Decode failed, use zero padding
+                        frame[name] = zero_pad_map[name]
+                        continue
+                
                     # Ensure deterministic storage; lerobot loaders will map back to float [0,1]
                     if arr.dtype != np.uint8:
                         arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
                     frame[name] = arr
-
-                    # Clean up
-                    if temp_path:
-                        active_images.setdefault(name, []).append(temp_path)
-
-                        idx = int(os.path.basename(temp_path).split("_")[-1].split(".")[0])
-                        # delete image from 0 to N - safe_window
-                        for old_path in list(active_images[name]):
-                            old_idx = int(os.path.basename(old_path).split("_")[-1].split(".")[0])
-                            if old_idx < idx - safe_window:
-                                try:
-                                    os.remove(old_path)
-                                except FileNotFoundError:
-                                    pass
-                                active_images[name].remove(old_path)
                     
 
                 elif dtype in ("float32", "float64"):
