@@ -10,5 +10,5 @@ rsync -av \
   /workspace/ src/rosetta/
 
 source /opt/ros/humble/setup.bash
-colcon build --packages-ignore turtlebot3_gazebo turtlebot3_fake_node
+colcon build --symlink-install --packages-ignore turtlebot3_gazebo turtlebot3_fake_node
 source install/setup.bash

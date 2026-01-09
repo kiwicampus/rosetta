@@ -13,14 +13,14 @@ Publishes:
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
 import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-from sensor_msgs.msg import Image
-from geometry_msgs.msg import TwistStamped
 from cv_bridge import CvBridge
-import cv2
+from geometry_msgs.msg import TwistStamped
+from rclpy.node import Node
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from sensor_msgs.msg import Image
 
 
 class PolicyVisualizer(Node):
@@ -83,7 +83,7 @@ class PolicyVisualizer(Node):
             qos_profile
         )
 
-        self.get_logger().info(f'Velocity Overlay Node started')
+        self.get_logger().info('Velocity Overlay Node started')
         self.get_logger().info(f'  Image topic: {image_topic}')
         self.get_logger().info(f'  Twist topic: {twist_topic}')
         self.get_logger().info(f'  Output topic: {output_topic}')
@@ -98,10 +98,11 @@ class PolicyVisualizer(Node):
         """Process image and overlay velocity visualization."""
         try:
             # Convert ROS Image to OpenCV format
-            cv_image = self.bridge.imgmsg_to_cv2(msg)
+            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             
             # Create overlay
             overlay_image = self.create_overlay(cv_image)
+            # print(overlay_image.shape)
 
             # import cv2
             # cv2.imshow("Overlay", overlay_image)
@@ -109,7 +110,6 @@ class PolicyVisualizer(Node):
             
             # Convert back to ROS Image
             output_msg = self.bridge.cv2_to_imgmsg(overlay_image, encoding='bgr8')
-            output_msg.header = msg.header
             
             # Publish
             self.image_pub.publish(output_msg)
