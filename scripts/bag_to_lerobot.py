@@ -180,25 +180,27 @@ def _save_image_to_disk(img_array: np.ndarray, temp_dir: Path, idx: int)->str: #
 def _load_image_from_disk(filepath: str) -> np.ndarray:  #Nuevo
     return np.load(filepath)
 
-# Key: (bag_dir, topic, timestamp) -> decoded frame
+# Only keeps frames within the window (50 frames before current position)
 _frame_cache: Dict[Tuple[Path, str, int], Optional[np.ndarray]] = {}
-# Track the last decoded timestamp per (bag_dir, topic) to continue sequential decoding
-_last_decoded_ts: Dict[Tuple[Path, str], int] = {}
+_current_position: Dict[Tuple[Path, str], int] = {}  # Current frame index in log_times
+_last_decoded_ts: Dict[Tuple[Path, str], int] = {}  # Last decoded log_time
+CACHE_WINDOW_SIZE = 50
 
 def _load_frame_from_mcap(
     bag_dir: Path,
     topic: str,
-    target_log_time: int,  # Direct log_time from resampling, no need to search
+    target_log_time: int, 
     stream: _Stream,
     header_times: List[int],
-    log_times: List[int]
+    log_times: List[int],
+    current_frame_idx: int = None  # Current frame index for window management
 ) -> Optional[np.ndarray]:
     """
     Decode a single frame from MCAP using the log_time directly.
     Similar to bag_reader.load_frame_at but adapted for bag_to_lerobot.
     
     For H.264 decoding, we need to decode sequentially to maintain decoder context.
-    We cache decoded frames and continue from the last decoded position.
+    A sliding window cache (50 frames before current position) is used to maintain key frames available
     
     Parameters
     ----------
@@ -211,9 +213,11 @@ def _load_frame_from_mcap(
     stream : _Stream
         Stream object containing spec and ros_type
     header_times : List[int]
-        List of header timestamps (for cache key)
+        List of header timestamps 
     log_times : List[int]
         List of log times (for finding start position)
+    current_frame_idx : int, optional
+        Current frame index for window management (used to purge old frames)
         
     Returns
     -------
@@ -224,45 +228,54 @@ def _load_frame_from_mcap(
         print("[WARN] No timestamps available")
         return None
     
-    # Find corresponding header_time for this log_time
-    log_idx = log_times.index(target_log_time)
-    target_header_ts = header_times[log_idx]
+    stream_key = (bag_dir, topic)
+    cache_key = (bag_dir, topic, target_log_time)
     
-    cache_key = (bag_dir, topic, target_header_ts)
+    # Check cache first
     if cache_key in _frame_cache:
         return _frame_cache[cache_key]
     
-    stream_key = (bag_dir, topic)
-    
     # Determine where to start decoding
-    # Continue from previously decoded frames or at the beginning
+    start_log_time = log_times[0] if log_times else 0
+    
     if stream_key in _last_decoded_ts:
-        start_log_time = _last_decoded_ts[stream_key]
-        # If target is before last decoded, reset and start from beginning
-        if target_log_time < start_log_time:
-            # Reset decoder state for this topic to start fresh
+        last_decoded_log_time = _last_decoded_ts[stream_key]
+        # If target is after last decoded, start from there 
+        if target_log_time >= last_decoded_log_time:
+            start_log_time = last_decoded_log_time
+        else:
+            # Target is before last decoded, need to reset decoder
             from rosetta.common.decoders import _decoder_state
             if topic in _decoder_state:
                 del _decoder_state[topic]
-            start_log_time = log_times[0] if log_times else 0
-            _last_decoded_ts[stream_key] = start_log_time
+            # Find the frame index in log_times to determine window start
+            try:
+                target_idx = log_times.index(target_log_time)
+                # Start from 50 frames before target (window start)
+                window_start_idx = max(0, target_idx - CACHE_WINDOW_SIZE)
+                start_log_time = log_times[window_start_idx]
+            except ValueError:
+                start_log_time = log_times[0] if log_times else 0
     else:
         # First time decoding this stream - start from beginning
         start_log_time = log_times[0] if log_times else 0
-        _last_decoded_ts[stream_key] = start_log_time
+    
+    # Update current position for window management
+    if current_frame_idx is not None:
+        _current_position[stream_key] = current_frame_idx
+        # Purge frames outside window
+        _purge_cache_outside_window(stream_key, current_frame_idx, log_times)
     
     # Decode from MCAP
     try:
         mcap_files = list(bag_dir.glob("*.mcap"))
         if not mcap_files:
             print(f"[WARN] MCAP file not found in {bag_dir}")
-            _frame_cache[cache_key] = None
             return None
         
         mcap_path = mcap_files[0]
         if not mcap_path.exists():
             print(f"[WARN] MCAP file not found: {mcap_path}")
-            _frame_cache[cache_key] = None
             return None
         
         # Decode sequentially from start_log_time to target_log_time
@@ -279,43 +292,81 @@ def _load_frame_from_mcap(
                 msg = deserialize_message(message.data, get_message(stream.ros_type))
                 
                 # Get message timestamp and log_time
-                msg_header_ts = int(msg.timestamp.sec) * 1_000_000_000 + int(msg.timestamp.nanosec)
                 msg_log_time = message.log_time
                 
-                # Decode all frames sequentially (needed for H.264 context)
-                # Cache all decoded frames to avoid re-decoding
-                frame_cache_key = (bag_dir, topic, msg_header_ts)
+                frame_cache_key = (bag_dir, topic, msg_log_time)
                 if frame_cache_key in _frame_cache:
                     val = _frame_cache[frame_cache_key]
                 else:
                     val = decode_value(stream.ros_type, msg, stream.spec)
-                    # Cache the decoded frame
-                    _frame_cache[frame_cache_key] = val
-                    # Update last decoded log_time
-                    _last_decoded_ts[stream_key] = msg_log_time
+                    # Cache the decoded frame (window is managed by purge function)
+                    if val is not None:
+                        _frame_cache[frame_cache_key] = val
                 
-                # Check if this is the target frame (match by log_time)
-                if abs(msg_log_time - target_log_time) < 10_000_000:  # 10ms tolerance for log_time
+                # Update last decoded log_time
+                _last_decoded_ts[stream_key] = msg_log_time
+                
+                # Check if this is the target frame 
+                if msg_log_time == target_log_time:
                     if val is not None:
                         target_val = val
                         break  # Found target, stop
                 
-                # Stop if we've passed the target by more than tolerance
-                if msg_log_time > target_log_time + 10_000_000:
+                # Stop if we've passed the target
+                if msg_log_time > target_log_time:
                     break
             
             # Cache the result
-            _frame_cache[cache_key] = target_val
+            if target_val is not None:
+                _frame_cache[cache_key] = target_val
             return target_val
             
     except Exception as e:
         print(f"[WARN] Failed to decode frame at log_time {target_log_time} from MCAP: {e}")
         import traceback
         traceback.print_exc()
-        _frame_cache[cache_key] = None
         return None
     
     return None
+
+def _purge_cache_outside_window(stream_key: Tuple[Path, str], current_idx: int, log_times: List[int]):
+    """
+    Purge frames from cache that are outside the window (more than 50 frames before current).
+    
+    Parameters
+    ----------
+    stream_key : Tuple[Path, str]
+        (bag_dir, topic) tuple identifying the stream
+    current_idx : int
+        Current frame index in log_times
+    log_times : List[int]
+        List of log times for determining which frames to keep
+    """
+    if not log_times or current_idx < 0:
+        return
+    
+    bag_dir, topic = stream_key
+    window_start_idx = max(0, current_idx - CACHE_WINDOW_SIZE)
+    
+    # Determine which log_times are within the window
+    if window_start_idx < len(log_times):
+        window_log_times = set(log_times[window_start_idx:current_idx + 1])
+    else:
+        window_log_times = set()
+    
+    # Find all cache keys for this stream and purge those outside window
+    keys_to_delete = []
+    for cache_key in _frame_cache.keys():
+        cache_bag_dir, cache_topic, cache_log_time = cache_key
+        if cache_bag_dir == bag_dir and cache_topic == topic:
+            if cache_log_time not in window_log_times:
+                keys_to_delete.append(cache_key)
+    
+    # Delete frames outside window
+    for key in keys_to_delete:
+        frame = _frame_cache.pop(key, None)
+        if frame is not None and isinstance(frame, np.ndarray):
+            del frame
 
 def _plan_streams(
     specs: Iterable[Any],
@@ -893,13 +944,20 @@ def export_bags_to_lerobot(
                     
                     st = streams[name]
                     # Decode from MCAP using the resampled log_time directly 
+                    # Find the index of this log_time in st.log_times for window management
+                    try:
+                        frame_idx = st.log_times.index(int(resampled_log_time))
+                    except ValueError:
+                        frame_idx = None
+                    
                     arr = _load_frame_from_mcap(
                         bag_dir=bag_dir,
                         topic=st.spec.topic,
                         target_log_time=int(resampled_log_time),
                         stream=st,
                         header_times=st.ts,
-                        log_times=st.log_times
+                        log_times=st.log_times,
+                        current_frame_idx=frame_idx
                     )
                     if arr is None:
                         # Decode failed, use zero padding
