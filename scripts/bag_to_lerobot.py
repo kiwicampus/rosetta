@@ -86,7 +86,7 @@ Notes
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -96,7 +96,6 @@ import yaml
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
-import tempfile 
 import os 
 from pathlib import Path
 from mcap.reader import make_reader
@@ -149,12 +148,7 @@ class _Stream:
     val: List[Any]
     is_image: bool = False  
     temp_dir: Optional[Path] = None
-    log_times: List[int] = None
-    
-    def __post_init__(self):
-        if self.log_times is None:
-            self.log_times = [] 
-
+    log_times: List[int] = field(default_factory=list)
 
 # ---------------------------------------------------------------------------
 
@@ -171,14 +165,6 @@ def _read_yaml(p: Path) -> Dict[str, Any]:
 def _topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
     """Build a `{topic: type}` map from a rosbag2 reader."""
     return {t.name: t.type for t in reader.get_all_topics_and_types()}
-
-def _save_image_to_disk(img_array: np.ndarray, temp_dir: Path, idx: int)->str: #Nuevo
-    filepath = temp_dir / f"img_{idx:08d}.npy"
-    np.save(filepath, img_array)
-    return str(filepath)
-
-def _load_image_from_disk(filepath: str) -> np.ndarray:  #Nuevo
-    return np.load(filepath)
 
 # Only keeps frames within the window (50 frames before current position)
 _frame_cache: Dict[Tuple[Path, str, int], Optional[np.ndarray]] = {}
@@ -202,7 +188,6 @@ def _get_or_create_mcap_reader(bag_dir: Path, topic: str):
         
     Returns
     -------
-    tuple[Any, Any] or None
         (file_handle, reader) tuple, or None if MCAP file not found
     """
     reader_key = (bag_dir, topic)
@@ -238,7 +223,6 @@ def _get_or_create_mcap_reader(bag_dir: Path, topic: str):
 def _close_mcap_readers_for_bag(bag_dir: Path):
     """
     Close all MCAP readers for a specific bag_dir.
-    This should be called after processing an episode is complete.
     
     Parameters
     ----------
@@ -292,10 +276,7 @@ def _load_frame_from_mcap(
     np.ndarray or None
         Decoded image array or None if not found
     """
-    if not header_times or not log_times:
-        print("[WARN] No timestamps available")
-        return None
-    
+
     stream_key = (bag_dir, topic)
     cache_key = (bag_dir, topic, target_log_time)
     
@@ -309,11 +290,11 @@ def _load_frame_from_mcap(
     
     if stream_key in _last_decoded_ts:
         last_decoded_log_time = _last_decoded_ts[stream_key]
-        # If target is after last decoded, start from there (more efficient)
+        
         if target_log_time >= last_decoded_log_time:
             start_log_time = last_decoded_log_time
         else:
-            # Target is before last decoded, need to reset decoder
+            # Target is before last decoded, reset decoder
             from rosetta.common.decoders import _decoder_state
             if topic in _decoder_state:
                 del _decoder_state[topic]
@@ -335,7 +316,7 @@ def _load_frame_from_mcap(
         # Purge frames outside window
         _purge_cache_outside_window(stream_key, current_frame_idx, log_times)
     
-    # Get or create MCAP reader (reused across calls)
+    # Get or create MCAP reader 
     reader_result = _get_or_create_mcap_reader(bag_dir, topic)
     if reader_result is None:
         return None
@@ -343,7 +324,6 @@ def _load_frame_from_mcap(
     f, reader = reader_result
     
     # Decode sequentially from start_log_time to target_log_time
-    # This ensures the H.264 decoder has proper context
     target_val = None
     
     try:
@@ -353,30 +333,26 @@ def _load_frame_from_mcap(
         ):
             msg = deserialize_message(message.data, get_message(stream.ros_type))
             
-            # Get message timestamp and log_time
             msg_log_time = message.log_time
             
-            # Decode the frame (needed for H.264 sequential decoding)
+            # Decode the frame 
             # Check cache first to avoid re-decoding
             frame_cache_key = (bag_dir, topic, msg_log_time)
             if frame_cache_key in _frame_cache:
                 val = _frame_cache[frame_cache_key]
             else:
                 val = decode_value(stream.ros_type, msg, stream.spec)
-                # Cache the decoded frame (window will be managed by purge function)
                 if val is not None:
                     _frame_cache[frame_cache_key] = val
             
             # Update last decoded log_time
             _last_decoded_ts[stream_key] = msg_log_time
             
-            # Check if this is the target frame (exact match by log_time)
             if msg_log_time == target_log_time:
                 if val is not None:
                     target_val = val
                     break  # Found target, stop
             
-            # Stop if we've passed the target
             if msg_log_time > target_log_time:
                 break
         
@@ -387,8 +363,6 @@ def _load_frame_from_mcap(
         
     except Exception as e:
         print(f"[WARN] Failed to decode frame at log_time {target_log_time} from MCAP: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 def _purge_cache_outside_window(stream_key: Tuple[Path, str], current_idx: int, log_times: List[int]):
@@ -433,7 +407,6 @@ def _purge_cache_outside_window(stream_key: Tuple[Path, str], current_idx: int, 
 def _plan_streams(
     specs: Iterable[Any],
     tmap: Dict[str, str],
-    temp_root: Path,
 ) -> Tuple[Dict[str, _Stream], Dict[str, List[str]]]:
     """Plan `_Stream` buffers for contract specs and build a topic dispatch index.
 
@@ -581,7 +554,7 @@ def export_bags_to_lerobot(
     out_root: Path,
     repo_id: str = "rosbag_v30",
     use_videos: bool = True,
-    image_writer_threads: int = 6,
+    image_writer_threads: int = 16,
     image_writer_processes: int = 0,
     chunk_size: int = 1000,
     data_mb: int = 100,
@@ -781,7 +754,6 @@ def export_bags_to_lerobot(
     for epi_idx, bag_dir in enumerate(bag_dirs):
         print(f"[Episode {epi_idx}] {bag_dir}")
 
-        temp_episode_dir = Path(tempfile.mkdtemp(prefix=f"lerobot_images_ep{epi_idx}_")) 
         try:
             meta = _read_yaml(bag_dir / "metadata.yaml")
             info = meta.get("rosbag2_bagfile_information") or {}
@@ -810,7 +782,7 @@ def export_bags_to_lerobot(
         tmap = _topic_type_map(reader)
         
         # Plan once - handle multiple observation.state specs and action specs
-        streams, by_topic = _plan_streams(specs, tmap, temp_episode_dir)
+        streams, by_topic = _plan_streams(specs, tmap)
         
         # Create consolidated observation.state stream if we have multiple state specs
         if state_specs:
@@ -825,7 +797,7 @@ def export_bags_to_lerobot(
         decoded_msgs = 0
         message_counter = 0
 
-        # Extract timestamps only for images, decode non-images immediately
+        # Decode single pass
         while reader.has_next():
             topic, data, bag_ns = reader.read_next()
             message_counter += 1
@@ -836,10 +808,10 @@ def export_bags_to_lerobot(
                 sv = st.spec
                 
                 if st.is_image:
-                    # For images: store header_time and log_time (bag_ns as approximation)
+                    # For images: store header_time and log_time 
                     msg = deserialize_message(data, get_message(st.ros_type))
                     
-                    # Timestamp selection policy (header_time for resampling)
+                    # Timestamp selection policy 
                     if timestamp_source == "receive":
                         ts_sel = int(bag_ns)
                     elif timestamp_source == "header":
@@ -852,10 +824,10 @@ def export_bags_to_lerobot(
                             ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
                     
                     # Store header_time for resampling and log_time (bag_ns) for direct MCAP seeking
-                    log_time = int(bag_ns)  # Use bag_ns as approximation of MCAP log_time
-                    st.ts.append(ts_sel)  # Header timestamp for resampling
-                    st.val.append(log_time)  # Store log_time as value - resampling will select which log_time to use
-                    st.log_times.append(log_time)  # store in log_times for direct lookup
+                    log_time = int(bag_ns) 
+                    st.ts.append(ts_sel)  
+                    st.val.append(log_time)  
+                    st.log_times.append(log_time) 
                     decoded_msgs += 1
                 else:
                     msg = deserialize_message(data, get_message(st.ros_type))
@@ -882,7 +854,7 @@ def export_bags_to_lerobot(
                         print("not valid", st.ros_type)
         if decoded_msgs == 0:
             raise RuntimeError(f"No usable messages in {bag_dir} (none decoded).")
-        
+
         # Choose anchor + duration
         valid_ts = [
             np.asarray(st.ts, dtype=np.int64) for st in streams.values() if st.ts
@@ -928,9 +900,6 @@ def export_bags_to_lerobot(
                 pol, ts, st.val, ticks_ns, step_ns, st.spec.asof_tol_ms
             )
             
-        safe_window = 10
-        active_images = {}
-
         print("Resampling done")
         # Write frames
 
@@ -1005,8 +974,6 @@ def export_bags_to_lerobot(
                     resampled_log_time = val
                     
                     st = streams[name]
-                    # Decode from MCAP using the resampled log_time directly 
-                    # Find the index of this log_time in st.log_times for window management
                     try:
                         frame_idx = st.log_times.index(int(resampled_log_time))
                     except ValueError:
@@ -1060,7 +1027,6 @@ def export_bags_to_lerobot(
             f"  → saved {n_ticks} frames @ {int(round(fps))} FPS  | decoded_msgs={decoded_msgs}"
         )
         
-        # Close MCAP readers for this episode to free resources
         _close_mcap_readers_for_bag(bag_dir)
 
     
@@ -1090,7 +1056,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--no-videos", action="store_true", help="Store images instead of videos"
     )
-    ap.add_argument("--image-threads", type=int, default=6, help="Image writer threads")
+    ap.add_argument("--image-threads", type=int, default=16, help="Image writer threads")
     ap.add_argument(
         "--image-processes", type=int, default=0, help="Image writer processes"
     )
