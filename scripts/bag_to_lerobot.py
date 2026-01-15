@@ -86,12 +86,13 @@ Notes
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import yaml
+import time
 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
@@ -166,11 +167,15 @@ def _topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
     """Build a `{topic: type}` map from a rosbag2 reader."""
     return {t.name: t.type for t in reader.get_all_topics_and_types()}
 
-# Only keeps frames within the window (50 frames before current position)
+# Only keeps frames within the window (5 frames before current position)
 _frame_cache: Dict[Tuple[Path, str, int], Optional[np.ndarray]] = {}
 _current_position: Dict[Tuple[Path, str], int] = {}  # Current frame index in log_times
 _last_decoded_ts: Dict[Tuple[Path, str], int] = {}  # Last decoded log_time
-CACHE_WINDOW_SIZE = 50
+CACHE_WINDOW_SIZE = 5  
+MAX_CACHE_SIZE = 20  # 4 cameras × 5 frames
+
+# Debugging statistics for performance analysis
+_decode_stats: Dict[Tuple[Path, str], Dict[str, int]] = {}  # Per-stream decode statistics
 
 # MCAP readers cache: (bag_dir, topic) -> (file_handle, reader)
 _mcap_readers: Dict[Tuple[Path, str], Tuple[Any, Any]] = {}
@@ -280,24 +285,57 @@ def _load_frame_from_mcap(
     stream_key = (bag_dir, topic)
     cache_key = (bag_dir, topic, target_log_time)
     
+    # Initialize stats for this stream if not exists
+    if stream_key not in _decode_stats:
+        _decode_stats[stream_key] = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "frames_decoded": 0,
+            "backward_jumps": 0,
+            "total_frames_scanned": 0,
+            "total_decode_time": 0.0,  # Total time spent in decode_value (seconds)
+            "total_scan_time": 0.0,  # Total time spent scanning MCAP (seconds)
+            "total_packet_size": 0  # Total size of packets processed (bytes)
+        }
+    
+    stats = _decode_stats[stream_key]
+    
     # Check cache first
     if cache_key in _frame_cache:
+        stats["cache_hits"] += 1
         return _frame_cache[cache_key]
+    
+    stats["cache_misses"] += 1
+    
+    # Debug: Log cache miss for first few frames to understand pattern
+    if stats["cache_misses"] <= 5:
+        # Check if this log_time exists in other camera caches
+        other_camera_frames = []
+        for (other_bag, other_topic, other_log_time) in _frame_cache.keys():
+            if other_bag == bag_dir and other_topic != topic and other_log_time == target_log_time:
+                other_camera_frames.append(other_topic)
+        if other_camera_frames:
+            print(f"[Cache Debug] {topic} cache miss for frame {target_log_time} (miss #{stats['cache_misses']}) - BUT this frame exists in cache for: {other_camera_frames}")
+        else:
+            print(f"[Cache Debug] {topic} cache miss for frame {target_log_time} (miss #{stats['cache_misses']})")
     
     # Determine where to start decoding
     # Use last decoded position if available and target is after it
     start_log_time = log_times[0] if log_times else 0
     
+    #print(f"[Decoder] Loading frame for {topic} at log_time {target_log_time}")
     if stream_key in _last_decoded_ts:
         last_decoded_log_time = _last_decoded_ts[stream_key]
         
         if target_log_time >= last_decoded_log_time:
             start_log_time = last_decoded_log_time
         else:
-            # Target is before last decoded, reset decoder
+            # Target is before last decoded, reset decoder (backward jump)
+            stats["backward_jumps"] += 1
             from rosetta.common.decoders import _decoder_state
             if topic in _decoder_state:
                 del _decoder_state[topic]
+            print(f"[Decoder] Backward jump detected for {topic}: {last_decoded_log_time} -> {target_log_time}")
             # Find the frame index in log_times to determine window start
             try:
                 target_idx = log_times.index(target_log_time)
@@ -315,6 +353,8 @@ def _load_frame_from_mcap(
         _current_position[stream_key] = current_frame_idx
         # Purge frames outside window
         _purge_cache_outside_window(stream_key, current_frame_idx, log_times)
+    else:
+        print(f"[WARN] current_frame_idx is None for {topic} at log_time {target_log_time}")
     
     # Get or create MCAP reader 
     reader_result = _get_or_create_mcap_reader(bag_dir, topic)
@@ -327,13 +367,20 @@ def _load_frame_from_mcap(
     target_val = None
     
     try:
+        frames_scanned = 0
+        scan_start_time = time.time()
         for schema, channel, message in reader.iter_messages(
             topics=[topic],
             start_time=start_log_time
         ):
+            frames_scanned += 1
             msg = deserialize_message(message.data, get_message(stream.ros_type))
             
             msg_log_time = message.log_time
+            
+            # Track packet size for debugging
+            if hasattr(message, 'data'):
+                stats["total_packet_size"] += len(message.data)
             
             # Decode the frame 
             # Check cache first to avoid re-decoding
@@ -341,9 +388,20 @@ def _load_frame_from_mcap(
             if frame_cache_key in _frame_cache:
                 val = _frame_cache[frame_cache_key]
             else:
+                decode_start_time = time.time()
                 val = decode_value(stream.ros_type, msg, stream.spec)
+                decode_time = time.time() - decode_start_time
+                stats["total_decode_time"] += decode_time
+                
                 if val is not None:
                     _frame_cache[frame_cache_key] = val
+                    stats["frames_decoded"] += 1
+            
+            try:
+                current_msg_idx = log_times.index(msg_log_time)
+                _current_position[stream_key] = current_msg_idx
+            except ValueError as e:
+                print(f"[WARN] log_time {msg_log_time} not found in log_times for {topic}: {e}")
             
             # Update last decoded log_time
             _last_decoded_ts[stream_key] = msg_log_time
@@ -351,9 +409,15 @@ def _load_frame_from_mcap(
             if msg_log_time == target_log_time:
                 if val is not None:
                     target_val = val
+                    stats["total_frames_scanned"] += frames_scanned
+                    scan_time = time.time() - scan_start_time
+                    stats["total_scan_time"] += scan_time
                     break  # Found target, stop
             
             if msg_log_time > target_log_time:
+                stats["total_frames_scanned"] += frames_scanned
+                scan_time = time.time() - scan_start_time
+                stats["total_scan_time"] += scan_time
                 break
         
         # Cache the result
@@ -367,7 +431,7 @@ def _load_frame_from_mcap(
 
 def _purge_cache_outside_window(stream_key: Tuple[Path, str], current_idx: int, log_times: List[int]):
     """
-    Purge frames from cache that are outside the window (more than 50 frames before current).
+    Purge frames from cache that are outside the window (more than CACHE_WINDOW_SIZE frames before current).
     
     Parameters
     ----------
@@ -403,6 +467,50 @@ def _purge_cache_outside_window(stream_key: Tuple[Path, str], current_idx: int, 
         frame = _frame_cache.pop(key, None)
         if frame is not None and isinstance(frame, np.ndarray):
             del frame
+
+
+def _clear_cache_for_bag(bag_dir: Path):
+    """
+    Clear all cached frames for a specific bag_dir.
+    This should be called at the end of each episode to prevent memory accumulation.
+    
+    Parameters
+    ----------
+    bag_dir : Path
+        Path to the bag directory to clear cache for
+    """
+    keys_to_delete = []
+    for cache_key in _frame_cache.keys():
+        cache_bag_dir, cache_topic, cache_log_time = cache_key
+        if cache_bag_dir == bag_dir:
+            keys_to_delete.append(cache_key)
+    
+    # Count frames per topic for reporting
+    frames_by_topic = {}
+    for key in keys_to_delete:
+        _, topic, _ = key
+        frames_by_topic[topic] = frames_by_topic.get(topic, 0) + 1
+    
+    # Delete all frames for this bag
+    for key in keys_to_delete:
+        frame = _frame_cache.pop(key, None)
+        if frame is not None and isinstance(frame, np.ndarray):
+            del frame
+    
+    # Report cache cleanup if frames were cleared
+    if keys_to_delete:
+        total_frames = len(keys_to_delete)
+        topics_str = ", ".join([f"{topic}: {count}" for topic, count in frames_by_topic.items()])
+        print(f"  [Cache] Cleared {total_frames} cached frames ({topics_str})")
+    
+    # Also clear position tracking for this bag
+    keys_to_remove = [k for k in _current_position.keys() if k[0] == bag_dir]
+    for key in keys_to_remove:
+        _current_position.pop(key, None)
+    
+    keys_to_remove = [k for k in _last_decoded_ts.keys() if k[0] == bag_dir]
+    for key in keys_to_remove:
+        _last_decoded_ts.pop(key, None)
 
 def _plan_streams(
     specs: Iterable[Any],
@@ -471,79 +579,73 @@ def _plan_streams(
 def _detect_image_shapes_from_bag(
     bag_dir: Path,
     specs: List[Any],
-) -> Dict[str, Tuple[int, int, int]]:
-    """Pre-scan a bag to detect actual image shapes. To avoid errors when checking image size.
+) -> None:
+    """Pre-scan a bag to detect actual image shapes by reading /camera/color/camera_info.
+    Creates new SpecView objects with image_resize set for all image specs to ensure 
+    consistent sizing, including for dummy images. Uses MCAP reader format consistent 
+    with the rest of the codebase.
     
     Parameters
     ----------
     bag_dir : Path
         Path to the bag directory to scan.
     specs : list
-        List of SpecView objects from the contract.
-        
-    Returns
-    -------
-    dict[str, tuple[int, int, int]]
-        Mapping from feature key to detected (H, W, C) shape.
+        List of SpecView objects from the contract (will be modified in-place by replacing objects).
     """
-    detected_shapes: Dict[str, Tuple[int, int, int]] = {}
-    
-    # Find image specs
-    image_specs = [sv for sv in specs if sv.image_resize is not None]
-    if not image_specs:
-        return detected_shapes
-    
-    # Build topic -> spec mapping
-    topic_to_spec: Dict[str, Any] = {}
-    for sv in image_specs:
-        topic_to_spec[sv.topic] = sv
+    # Find image specs (all image specs, regardless of whether they have resize or not)
+    image_spec_indices = [i for i, sv in enumerate(specs) if "image" in sv.key.lower()]
+    if not image_spec_indices:
+        return
     
     try:
-        meta = _read_yaml(bag_dir / "metadata.yaml")
-        info = meta.get("rosbag2_bagfile_information") or {}
-        storage = info.get("storage_identifier") or "mcap"
+        mcap_files = list(bag_dir.glob("*.mcap"))
+        if not mcap_files:
+            print(f"[WARN] MCAP file not found in {bag_dir} for shape detection")
+            return
         
-        reader = rosbag2_py.SequentialReader()
-        reader.open(
-            rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id=storage),
-            rosbag2_py.ConverterOptions(
-                input_serialization_format="cdr",
-                output_serialization_format="cdr",
-            ),
-        )
+        mcap_path = mcap_files[0]
+        if not mcap_path.exists():
+            print(f"[WARN] MCAP file not found: {mcap_path}")
+            return
         
-        tmap = _topic_type_map(reader)
-        topics_found = set()
-        
-        # Scan until we've found one image from each topic
-        while reader.has_next() and len(topics_found) < len(topic_to_spec):
-            topic, data, _ = reader.read_next()
+        # Open MCAP reader
+        with open(mcap_path, "rb") as f:
+            reader = make_reader(f)
             
-            if topic not in topic_to_spec or topic in topics_found:
-                continue
+            # Look for /camera/color/camera_info topic
+            camera_info_topic = "/camera/color/camera_info"
+            height = None
+            width = None
+            
+            for schema, channel, message in reader.iter_messages(topics=[camera_info_topic]):
+                # Deserialize sensor_msgs/CameraInfo message
+                ros_type = "sensor_msgs/CameraInfo"
+                msg = deserialize_message(message.data, get_message(ros_type))
                 
-            sv = topic_to_spec[topic]
-            ros_type = sv.ros_type or tmap.get(topic)
-            if not ros_type:
-                continue
+                # Extract height and width from camera_info
+                height = msg.height
+                width = msg.width
+                print(f"[Auto-detect] Found camera_info: height={height}, width={width} from {camera_info_topic}")
                 
-            try:
-                msg = deserialize_message(data, get_message(ros_type))
-                val = decode_value(ros_type, msg, sv)
-                
-                if val is not None and isinstance(val, np.ndarray) and len(val.shape) == 3:
-                    h, w, c = val.shape
-                    detected_shapes[sv.key] = (h, w, c)
-                    topics_found.add(topic)
-                    print(f"[Auto-detect] {sv.key}: detected shape ({h}, {w}, {c})")
-            except Exception as e:
-                print(f"[WARN] Could not decode {topic} for shape detection: {e}")
-                continue
+                if height > 0 and width > 0:
+                    # Create new SpecView objects with image_resize set
+                    # This ensures all images (including dummies) have the same size
+                    for idx in image_spec_indices:
+                        sv = specs[idx]
+                        # Use replace() to create a new frozen dataclass instance with modified image_resize
+                        new_sv = replace(sv, image_resize=(height, width))
+                        specs[idx] = new_sv
+                        print(f"[Auto-detect] {sv.key}: set image_resize to ({height}, {width}) from {camera_info_topic}")
+                    
+                    break  # Found it, stop scanning
+            
+            if height is None or width is None:
+                print(f"[WARN] Could not find {camera_info_topic} in bag, skipping shape detection")
                 
     except Exception as e:
         print(f"[WARN] Could not pre-scan bag for image shapes: {e}")
-    
-    return detected_shapes
+        import traceback
+        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +656,7 @@ def export_bags_to_lerobot(
     out_root: Path,
     repo_id: str = "rosbag_v30",
     use_videos: bool = True,
-    image_writer_threads: int = 16,
+    image_writer_threads: int = 6,
     image_writer_processes: int = 0,
     chunk_size: int = 1000,
     data_mb: int = 100,
@@ -616,12 +718,10 @@ def export_bags_to_lerobot(
     specs = list(iter_specs(contract))
 
     # Pre-scan first bag to detect actual image shapes
-    detected_shapes: Dict[str, Tuple[int, int, int]] = {}
+    # Detect image shapes from bag and set image_resize directly on specs
     if bag_dirs:
         print("[Auto-detect] Scanning first bag to detect image shapes...")
-        detected_shapes = _detect_image_shapes_from_bag(bag_dirs[0], specs)
-        if detected_shapes:
-            print(f"[Auto-detect] Detected shapes for {len(detected_shapes)} image streams")
+        _detect_image_shapes_from_bag(bag_dirs[0], specs)
 
     # Features (also detect first image key as anchor)
     features: Dict[str, Dict[str, Any]] = {}
@@ -660,14 +760,6 @@ def export_bags_to_lerobot(
                 # Update the shape to reflect 3 channels
                 ft["shape"] = list(ft["shape"])
                 ft["shape"][-1] = 3
-            
-            # Override shape with detected shape if available (for images)
-            if is_img and k in detected_shapes:
-                detected_h, detected_w, detected_c = detected_shapes[k]
-                contract_shape = tuple(ft["shape"])
-                if contract_shape != (detected_h, detected_w, detected_c):
-                    print(f"[Auto-detect] {k}: overriding contract shape {contract_shape} -> ({detected_h}, {detected_w}, {detected_c})")
-                    ft["shape"] = (detected_h, detected_w, detected_c)
             
             features[k] = ft
         if is_img and primary_image_key is None:
@@ -714,6 +806,12 @@ def export_bags_to_lerobot(
             if "info" not in feature:
                 feature["info"] = {}
             feature["info"]["video.is_depth_map"] = True
+
+    # Add observation.state.* string fields from metadata.yaml custom_data
+    features["observation.state.road_type"] = {"dtype": "string", "shape": (1,)}
+    features["observation.state.surface"] = {"dtype": "string", "shape": (1,)}
+    features["observation.state.weather"] = {"dtype": "string", "shape": (1,)}
+    features["observation.state.time_of_day"] = {"dtype": "string", "shape": (1,)}
 
     # Dataset
     ds = LeRobotDataset.create(
@@ -762,10 +860,23 @@ def export_bags_to_lerobot(
 
             # Operator prompt (if present). Accept either old/new keys gracefully.
             prompt = ""
+            # Initialize state variables with default empty strings
+            road_type = ""
+            surface = ""
+            weather = ""
+            time_of_day = ""
+            
             cd = info.get("custom_data")
             if isinstance(cd, dict):
-                prompt = cd.get("prompt", prompt) or prompt   #value in custom data: prompt
-
+                prompt = cd.get("prompt", prompt) or prompt   #value in custom_data: prompt
+                
+                # Extract state variables from custom_data (road_type, surface, weather, time_of_day)
+                # These will be added to each frame as observation.state.* fields
+                road_type = cd.get("road_type", "")
+                surface = cd.get("surface", "")
+                weather = cd.get("weather", "")
+                time_of_day = cd.get("time_of_day", "")
+           
             # Reader
             reader = rosbag2_py.SequentialReader()
             reader.open(
@@ -902,8 +1013,31 @@ def export_bags_to_lerobot(
             
         print("Resampling done")
         # Write frames
+        print(f"Processing {n_ticks} frames...")
 
         for i in range(n_ticks):
+            # Print progress every 10% or every 100 frames, whichever is more frequent
+            if i == 0 or (i + 1) % max(1, min(100, n_ticks // 10)) == 0 or (i + 1) == n_ticks:
+                progress_pct = ((i + 1) / n_ticks) * 100
+                print(f"  Frame {i + 1}/{n_ticks} ({progress_pct:.1f}%)")
+                
+                # Print decode statistics every 100 frames
+                if (i + 1) % 100 == 0 or (i + 1) == n_ticks:
+                    for (stats_bag_dir, stats_topic), stats in _decode_stats.items():
+                        if stats_bag_dir == bag_dir:
+                            total_requests = stats["cache_hits"] + stats["cache_misses"]
+                            if total_requests > 0:
+                                cache_hit_rate = (stats["cache_hits"] / total_requests * 100)
+                                avg_frames_per_request = (stats["total_frames_scanned"] / stats["cache_misses"]) if stats["cache_misses"] > 0 else 0
+                                
+                                # Timing metrics
+                                avg_decode_time = (stats["total_decode_time"] / stats["frames_decoded"] * 1000) if stats["frames_decoded"] > 0 else 0
+                                avg_scan_time = (stats["total_scan_time"] / stats["cache_misses"] * 1000) if stats["cache_misses"] > 0 else 0
+                                avg_packet_size = (stats["total_packet_size"] / stats["frames_decoded"]) if stats["frames_decoded"] > 0 else 0
+                                
+                                print(f"    [{stats_topic}] Decoded: {stats['frames_decoded']} | "
+                                      f"Decode: {avg_decode_time:.1f}ms/frame | Scan: {avg_scan_time:.1f}ms/miss | "
+                                      f"Packet: {avg_packet_size/1024:.1f}KB")
             frame: Dict[str, Any] = {}
             
 
@@ -959,6 +1093,15 @@ def export_bags_to_lerobot(
                 
                 # Skip consolidated actions as they're handled above
                 if name in action_specs_by_key: 
+                    continue
+                
+                # Skip observation.state.* metadata fields as they're handled below
+                if name.startswith("observation.state.") and name in [
+                    "observation.state.road_type",
+                    "observation.state.surface",
+                    "observation.state.weather",
+                    "observation.state.time_of_day"
+                ]:
                     continue
                     
                 ft = features[name]
@@ -1020,12 +1163,20 @@ def export_bags_to_lerobot(
             # This is`` distinct from any per-frame task.* fields coming from ROS topics.
             # LeRobot requires 'task' field in every frame, so always set it (empty string if no prompt).
             frame["task"] = prompt if prompt else ""
+            
+            # Add state variables from metadata.yaml custom_data as observation.state.* fields
+            # These are constant for the entire episode
+            frame["observation.state.road_type"] = road_type if road_type else ""
+            frame["observation.state.surface"] = surface if surface else ""
+            frame["observation.state.weather"] = weather if weather else ""
+            frame["observation.state.time_of_day"] = time_of_day if time_of_day else ""
+            
             ds.add_frame(frame)
 
         ds.save_episode()
         print(
             f"  → saved {n_ticks} frames @ {int(round(fps))} FPS  | decoded_msgs={decoded_msgs}"
-        )
+         )
         
         _close_mcap_readers_for_bag(bag_dir)
 

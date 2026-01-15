@@ -186,16 +186,13 @@ _decoder_state = {}
 
 def create_dummy_image(msg, spec, output_encoding='rgb8'):
     print(f"[FoxgloveDecoder] Skipping frame  (warming up)")
-    # Return a black dummy image of reasonable size (e.g., 480x640)
     dummy = Image()
     dummy.header.stamp = msg.timestamp
     dummy.header.frame_id = msg.frame_id
 
-    if spec.image_resize:
-        h, w = spec.image_resize
-    else:
-        h, w = 360, 640  
-
+    h, w = spec.image_resize
+    
+    print(f"[FoxgloveDecoder] Creating dummy image of size {w}x{h}")
     dummy.height = int(h)
     dummy.width = int(w)
     dummy.encoding = output_encoding
