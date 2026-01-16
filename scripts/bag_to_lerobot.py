@@ -174,9 +174,6 @@ _last_decoded_ts: Dict[Tuple[Path, str], int] = {}  # Last decoded log_time
 CACHE_WINDOW_SIZE = 5  
 MAX_CACHE_SIZE = 20  # 4 cameras × 5 frames
 
-# Debugging statistics for performance analysis
-_decode_stats: Dict[Tuple[Path, str], Dict[str, int]] = {}  # Per-stream decode statistics
-
 # MCAP readers cache: (bag_dir, topic) -> (file_handle, reader)
 _mcap_readers: Dict[Tuple[Path, str], Tuple[Any, Any]] = {}
 
@@ -285,39 +282,9 @@ def _load_frame_from_mcap(
     stream_key = (bag_dir, topic)
     cache_key = (bag_dir, topic, target_log_time)
     
-    # Initialize stats for this stream if not exists
-    if stream_key not in _decode_stats:
-        _decode_stats[stream_key] = {
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "frames_decoded": 0,
-            "backward_jumps": 0,
-            "total_frames_scanned": 0,
-            "total_decode_time": 0.0,  # Total time spent in decode_value (seconds)
-            "total_scan_time": 0.0,  # Total time spent scanning MCAP (seconds)
-            "total_packet_size": 0  # Total size of packets processed (bytes)
-        }
-    
-    stats = _decode_stats[stream_key]
-    
     # Check cache first
     if cache_key in _frame_cache:
-        stats["cache_hits"] += 1
         return _frame_cache[cache_key]
-    
-    stats["cache_misses"] += 1
-    
-    # Debug: Log cache miss for first few frames to understand pattern
-    if stats["cache_misses"] <= 5:
-        # Check if this log_time exists in other camera caches
-        other_camera_frames = []
-        for (other_bag, other_topic, other_log_time) in _frame_cache.keys():
-            if other_bag == bag_dir and other_topic != topic and other_log_time == target_log_time:
-                other_camera_frames.append(other_topic)
-        if other_camera_frames:
-            print(f"[Cache Debug] {topic} cache miss for frame {target_log_time} (miss #{stats['cache_misses']}) - BUT this frame exists in cache for: {other_camera_frames}")
-        else:
-            print(f"[Cache Debug] {topic} cache miss for frame {target_log_time} (miss #{stats['cache_misses']})")
     
     # Determine where to start decoding
     # Use last decoded position if available and target is after it
@@ -331,7 +298,6 @@ def _load_frame_from_mcap(
             start_log_time = last_decoded_log_time
         else:
             # Target is before last decoded, reset decoder (backward jump)
-            stats["backward_jumps"] += 1
             from rosetta.common.decoders import _decoder_state
             if topic in _decoder_state:
                 del _decoder_state[topic]
@@ -367,20 +333,13 @@ def _load_frame_from_mcap(
     target_val = None
     
     try:
-        frames_scanned = 0
-        scan_start_time = time.time()
         for schema, channel, message in reader.iter_messages(
             topics=[topic],
             start_time=start_log_time
         ):
-            frames_scanned += 1
             msg = deserialize_message(message.data, get_message(stream.ros_type))
             
             msg_log_time = message.log_time
-            
-            # Track packet size for debugging
-            if hasattr(message, 'data'):
-                stats["total_packet_size"] += len(message.data)
             
             # Decode the frame 
             # Check cache first to avoid re-decoding
@@ -388,14 +347,10 @@ def _load_frame_from_mcap(
             if frame_cache_key in _frame_cache:
                 val = _frame_cache[frame_cache_key]
             else:
-                decode_start_time = time.time()
                 val = decode_value(stream.ros_type, msg, stream.spec)
-                decode_time = time.time() - decode_start_time
-                stats["total_decode_time"] += decode_time
                 
                 if val is not None:
                     _frame_cache[frame_cache_key] = val
-                    stats["frames_decoded"] += 1
             
             try:
                 current_msg_idx = log_times.index(msg_log_time)
@@ -409,15 +364,9 @@ def _load_frame_from_mcap(
             if msg_log_time == target_log_time:
                 if val is not None:
                     target_val = val
-                    stats["total_frames_scanned"] += frames_scanned
-                    scan_time = time.time() - scan_start_time
-                    stats["total_scan_time"] += scan_time
                     break  # Found target, stop
             
             if msg_log_time > target_log_time:
-                stats["total_frames_scanned"] += frames_scanned
-                scan_time = time.time() - scan_start_time
-                stats["total_scan_time"] += scan_time
                 break
         
         # Cache the result
@@ -849,7 +798,9 @@ def export_bags_to_lerobot(
     shapes = {k: tuple(features[k]["shape"]) for k in write_keys}
 
     # Episodes
+    total_episodes = len(bag_dirs)
     for epi_idx, bag_dir in enumerate(bag_dirs):
+        print(f"Processing episode {epi_idx + 1} of {total_episodes}")
         print(f"[Episode {epi_idx}] {bag_dir}")
 
         try:
@@ -866,16 +817,41 @@ def export_bags_to_lerobot(
             weather = ""
             time_of_day = ""
             
-            cd = info.get("custom_data")
+            cd = meta.get("custom_data") 
+            print(f"[Metadata] Checking custom_data for episode {epi_idx + 1}: cd type={type(cd)}, is_dict={isinstance(cd, dict) if cd is not None else False}", flush=True)
+            if cd is None:
+                print(f"[Metadata] custom_data not found at root level. Root keys: {list(meta.keys())}, info keys: {list(info.keys())}", flush=True)
+            
             if isinstance(cd, dict):
                 prompt = cd.get("prompt", prompt) or prompt   #value in custom_data: prompt
                 
                 # Extract state variables from custom_data (road_type, surface, weather, time_of_day)
                 # These will be added to each frame as observation.state.* fields
-                road_type = cd.get("road_type", "")
-                surface = cd.get("surface", "")
-                weather = cd.get("weather", "")
-                time_of_day = cd.get("time_of_day", "")
+                def safe_str(value, default=""):
+                    """Safely convert value to string, handling None and empty values."""
+                    if value is None:
+                        return default
+                    if isinstance(value, (list, tuple)) and len(value) > 0:
+                        # If it's a list/tuple, take the first element
+                        return str(value[0]) if value[0] is not None else default
+                    if isinstance(value, (list, tuple)) and len(value) == 0:
+                        return default
+                    value_str = str(value).strip()
+                    return value_str if value_str else default
+                
+                print(f"[Metadata] custom_data keys: {list(cd.keys())}", flush=True)
+                road_type = safe_str(cd.get("road_type"))
+                surface = safe_str(cd.get("surface"))
+                weather = safe_str(cd.get("weather"))
+                time_of_day = safe_str(cd.get("time_of_day"))
+                
+                # Debug: always print extracted values
+                print(f"[Metadata] Extracted custom_data: road_type='{road_type}', surface='{surface}', weather='{weather}', time_of_day='{time_of_day}'", flush=True)
+            else:
+                print(f"[Metadata] Warning: custom_data is not a dict or is None for episode {epi_idx + 1}. Type: {type(cd)}", flush=True)
+            
+            # Always print the prompt that will be saved to LeRobot task field
+            print(f"[Metadata] Prompt for LeRobot task: '{prompt}'", flush=True)
            
             # Reader
             reader = rosbag2_py.SequentialReader()
@@ -1020,24 +996,6 @@ def export_bags_to_lerobot(
             if i == 0 or (i + 1) % max(1, min(100, n_ticks // 10)) == 0 or (i + 1) == n_ticks:
                 progress_pct = ((i + 1) / n_ticks) * 100
                 print(f"  Frame {i + 1}/{n_ticks} ({progress_pct:.1f}%)")
-                
-                # Print decode statistics every 100 frames
-                if (i + 1) % 100 == 0 or (i + 1) == n_ticks:
-                    for (stats_bag_dir, stats_topic), stats in _decode_stats.items():
-                        if stats_bag_dir == bag_dir:
-                            total_requests = stats["cache_hits"] + stats["cache_misses"]
-                            if total_requests > 0:
-                                cache_hit_rate = (stats["cache_hits"] / total_requests * 100)
-                                avg_frames_per_request = (stats["total_frames_scanned"] / stats["cache_misses"]) if stats["cache_misses"] > 0 else 0
-                                
-                                # Timing metrics
-                                avg_decode_time = (stats["total_decode_time"] / stats["frames_decoded"] * 1000) if stats["frames_decoded"] > 0 else 0
-                                avg_scan_time = (stats["total_scan_time"] / stats["cache_misses"] * 1000) if stats["cache_misses"] > 0 else 0
-                                avg_packet_size = (stats["total_packet_size"] / stats["frames_decoded"]) if stats["frames_decoded"] > 0 else 0
-                                
-                                print(f"    [{stats_topic}] Decoded: {stats['frames_decoded']} | "
-                                      f"Decode: {avg_decode_time:.1f}ms/frame | Scan: {avg_scan_time:.1f}ms/miss | "
-                                      f"Packet: {avg_packet_size/1024:.1f}KB")
             frame: Dict[str, Any] = {}
             
 
@@ -1166,10 +1124,14 @@ def export_bags_to_lerobot(
             
             # Add state variables from metadata.yaml custom_data as observation.state.* fields
             # These are constant for the entire episode
-            frame["observation.state.road_type"] = road_type if road_type else ""
-            frame["observation.state.surface"] = surface if surface else ""
-            frame["observation.state.weather"] = weather if weather else ""
-            frame["observation.state.time_of_day"] = time_of_day if time_of_day else ""
+            frame["observation.state.road_type"] = str(road_type) if road_type and str(road_type).strip() else ""
+            frame["observation.state.surface"] = str(surface) if surface and str(surface).strip() else ""
+            frame["observation.state.weather"] = str(weather) if weather and str(weather).strip() else ""
+            frame["observation.state.time_of_day"] = str(time_of_day) if time_of_day and str(time_of_day).strip() else ""
+            
+            # Debug: log first frame values to verify they're being set correctly
+            if i == 0:
+                print(f"[Frame 0] Setting observation.state.* values: road_type='{frame['observation.state.road_type']}', surface='{frame['observation.state.surface']}', weather='{frame['observation.state.weather']}', time_of_day='{frame['observation.state.time_of_day']}'")
             
             ds.add_frame(frame)
 
