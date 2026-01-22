@@ -83,8 +83,6 @@ Notes
 
 """
 
-from __future__ import annotations
-
 import argparse
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -141,6 +139,8 @@ class _Stream:
         For images, this stores the log_time (MCAP log time) for direct decoding.
     log_times : list[int]
         For images: MCAP log times corresponding to each timestamp.
+    log_time_to_index : dict[int, int]
+        O(1) lookup dictionary: log_time -> index in log_times list.
     """
 
     spec: Any
@@ -150,6 +150,7 @@ class _Stream:
     is_image: bool = False  
     temp_dir: Optional[Path] = None
     log_times: List[int] = field(default_factory=list)
+    log_time_to_index: Dict[int, int] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 
@@ -303,12 +304,14 @@ def _load_frame_from_mcap(
                 del _decoder_state[topic]
             print(f"[Decoder] Backward jump detected for {topic}: {last_decoded_log_time} -> {target_log_time}")
             # Find the frame index in log_times to determine window start
-            try:
-                target_idx = log_times.index(target_log_time)
-                # Start from 50 frames before target (window start)
+            # Use O(1) lookup if available, otherwise fall back to index()
+            target_idx = stream.log_time_to_index.get(target_log_time)
+            
+            if target_idx is not None:
+                # Start from CACHE_WINDOW_SIZE frames before target (window start)
                 window_start_idx = max(0, target_idx - CACHE_WINDOW_SIZE)
                 start_log_time = log_times[window_start_idx]
-            except ValueError:
+            else:
                 start_log_time = log_times[0] if log_times else 0
     else:
         # First time decoding this stream - start from beginning
@@ -352,11 +355,17 @@ def _load_frame_from_mcap(
                 if val is not None:
                     _frame_cache[frame_cache_key] = val
             
-            try:
-                current_msg_idx = log_times.index(msg_log_time)
+            # Use O(1) lookup if available, otherwise fall back to index()
+            current_msg_idx = stream.log_time_to_index.get(msg_log_time)
+            if current_msg_idx is None:
+                try:
+                    current_msg_idx = log_times.index(msg_log_time)
+                except ValueError as e:
+                    print(f"[WARN] log_time {msg_log_time} not found in log_times for {topic}: {e}")
+                    current_msg_idx = None
+            
+            if current_msg_idx is not None:
                 _current_position[stream_key] = current_msg_idx
-            except ValueError as e:
-                print(f"[WARN] log_time {msg_log_time} not found in log_times for {topic}: {e}")
             
             # Update last decoded log_time
             _last_decoded_ts[stream_key] = msg_log_time
@@ -605,7 +614,7 @@ def export_bags_to_lerobot(
     out_root: Path,
     repo_id: str = "rosbag_v30",
     use_videos: bool = True,
-    image_writer_threads: int = 6,
+    image_writer_threads: int = 16,
     image_writer_processes: int = 0,
     chunk_size: int = 1000,
     data_mb: int = 100,
@@ -914,7 +923,8 @@ def export_bags_to_lerobot(
                     log_time = int(bag_ns) 
                     st.ts.append(ts_sel)  
                     st.val.append(log_time)  
-                    st.log_times.append(log_time) 
+                    st.log_times.append(log_time)
+                    st.log_time_to_index[log_time] = len(st.log_times) - 1
                     decoded_msgs += 1
                 else:
                     msg = deserialize_message(data, get_message(st.ros_type))
@@ -1075,10 +1085,13 @@ def export_bags_to_lerobot(
                     resampled_log_time = val
                     
                     st = streams[name]
-                    try:
-                        frame_idx = st.log_times.index(int(resampled_log_time))
-                    except ValueError:
-                        frame_idx = None
+                    # Use O(1) lookup if available, otherwise fall back to index()
+                    frame_idx = st.log_time_to_index.get(int(resampled_log_time))
+                    if frame_idx is None:
+                        try:
+                            frame_idx = st.log_times.index(int(resampled_log_time))
+                        except ValueError:
+                            frame_idx = None
                     
                     arr = _load_frame_from_mcap(
                         bag_dir=bag_dir,
@@ -1160,9 +1173,8 @@ def export_bags_to_lerobot(
 def parse_args() -> argparse.Namespace:
     """Parse command-line args for bag → LeRobot conversion."""
     ap = argparse.ArgumentParser("ROS2 bag → LeRobot v3 (using rosetta.common.*)")
-    g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--bag", help="Path to a single bag directory (episode)")
-    g.add_argument("--bags", help="Path to folder containing split0, split1, ... subfolders")
+    ap.add_argument("--bag", action="append", help="Path to a bag directory (episode). Can be specified multiple times.")
+    ap.add_argument("--bags", help="Path to folder containing split0, split1, ... subfolders")
     ap.add_argument("--contract", required=True, help="Path to YAML contract")
     ap.add_argument("--out", default="out_lerobot", help="Output root directory (default: out_lerobot)")
     ap.add_argument("--repo-id", default="rosbag_v30", help="repo_id metadata")
@@ -1237,14 +1249,28 @@ def main() -> None:
     args = parse_args()
     
     if args.bag:
-        input_path = Path(args.bag)
-        bag_dirs = [input_path]
-    else:
+        # Multiple --bag arguments provided
+        bag_dirs = [Path(p) for p in args.bag]
+        # Use first bag's parent directory name for output (or a generic name if from different sessions)
+        if len(bag_dirs) > 0:
+            # Try to find a common parent, otherwise use a generic name
+            common_parent = bag_dirs[0].parent
+            for bag_dir in bag_dirs[1:]:
+                if bag_dir.parent != common_parent:
+                    # Different parents, use generic name
+                    common_parent = Path("combined_sessions")
+                    break
+            input_path = common_parent
+        else:
+            raise ValueError("No bag directories provided")
+    elif args.bags:
         # Discover split folders from the provided directory
         input_path = Path(args.bags)
         if not input_path.exists():
             raise FileNotFoundError(f"Splits folder not found: {input_path}")
         bag_dirs = _discover_split_folders(input_path)
+    else:
+        raise ValueError("Either --bag or --bags must be provided")
     
     # Build output path: out_root/input_folder_name
     out_root = Path(args.out)
