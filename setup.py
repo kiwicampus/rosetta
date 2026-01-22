@@ -1,6 +1,7 @@
-from setuptools import setup, find_packages
 import os
 from glob import glob
+
+from setuptools import find_packages, setup
 
 package_name = 'rosetta'
 
@@ -44,6 +45,7 @@ setup(
         'console_scripts': [
             'episode_recorder = rosetta.episode_recorder:main',
             'policy_bridge_node = rosetta.policy_bridge_node:main',
+            'policy_visualizer_node = rosetta.policy_visualizer_node:main',
         ],
     },
 )

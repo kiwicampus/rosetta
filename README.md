@@ -185,6 +185,12 @@ ros2 launch rosetta turtlebot3_red_pillar_world.launch.py
 
 ---
 
+## Running Inside DevContainer
+
+For detailed instructions on running rosetta inside a devcontainer with rosbag playback or live robot connection via rosboard, see [Devcontainer.md](Devcontainer.md).
+
+---
+
 ## Contracts
 
 This repo ships `contracts/turtlebot.yaml` describing RGB, depth, state (joints/odom/imu), and a `cmd_vel` action. Use it as-is for the included TurtleBot contract.

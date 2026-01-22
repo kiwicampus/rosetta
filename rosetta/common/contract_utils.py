@@ -27,7 +27,7 @@ from rclpy.qos import (
 class AlignSpec:
     """Timestamp alignment/selection behavior for an observation stream.
 
-    strategy:  "hold" | "asof" | "drop"
+    strategy:  "hold" | "asof" | "drop" | "closest"
     tol_ms:    as-of tolerance in ms for 'asof' (ignored for others)
     stamp:     "receive" | "header"
     """
@@ -406,7 +406,6 @@ def decode_value(ros_type: str, msg, spec) -> Any:
 
 # ---------- Resampling (offline) ----------
 
-
 def resample_hold(
     ts_ns: np.ndarray, vals: List[Any], ticks_ns: np.ndarray
 ) -> List[Any]:
@@ -443,6 +442,7 @@ def resample_asof(
     return out
 
 
+
 def resample_drop(
     ts_ns: np.ndarray, vals: List[Any], ticks_ns: np.ndarray, step_ns: int
 ) -> List[Optional[Any]]:
@@ -455,6 +455,30 @@ def resample_drop(
         out.append(vals[j] if (j >= 0 and ts_ns[j] > t - step_ns) else None)
     return out
 
+def resample_closest(ts_ns: np.ndarray, vals: List[Any], ticks_ns: np.ndarray) -> List[Any]:
+    """
+    For each tick in `ticks_ns`, return the value in `vals` whose timestamp in `ts_ns`
+    is closest to the tick. Always returns a value (never None).
+    """
+    out: List[Any] = []
+    n = len(ts_ns)
+
+    for t in ticks_ns:
+        # i is the first index where ts_ns[i] > t
+        i = np.searchsorted(ts_ns, t, side='right')
+
+        if i == 0:
+            closest_idx = 0
+        elif i == n:
+            closest_idx = n - 1
+        else:
+            prev_diff = t - ts_ns[i - 1]
+            next_diff = ts_ns[i] - t
+            closest_idx = i - 1 if prev_diff <= next_diff else i
+
+        out.append(vals[closest_idx])
+
+    return out
 
 def resample(
     policy: str,
@@ -464,11 +488,14 @@ def resample(
     step_ns: int,
     tol_ms: int,
 ) -> List[Any]:
-    """Dispatch resampling policy: 'hold' | 'asof' | 'drop'."""
+    print(f"[RESAMPLE] policy={policy}, step_ns={step_ns}, tol_ms={tol_ms}")
+    """Dispatch resampling policy: 'hold' | 'asof' | 'drop' | 'closest'."""
     if policy == "drop":
         return resample_drop(ts_ns, vals, ticks_ns, step_ns)
     if policy == "asof":
         return resample_asof(ts_ns, vals, ticks_ns, max(0, int(tol_ms)) * 1_000_000)
+    if policy == "closest":
+        return resample_closest(ts_ns, vals, ticks_ns)
     return resample_hold(ts_ns, vals, ticks_ns)
 
 
@@ -497,6 +524,8 @@ class StreamBuffer:
         if self.policy == "drop":
             return self.last_val if (self.last_ts > tick_ns - self.step_ns) else None
         if self.policy == "asof":
+            return self.last_val if (tick_ns - self.last_ts <= self.tol_ns) else None
+        if self.policy == "closest":
             return self.last_val if (tick_ns - self.last_ts <= self.tol_ns) else None
         if self.policy == "hold":
             return self.last_val

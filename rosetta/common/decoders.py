@@ -17,8 +17,10 @@ Supported message types:
 
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
-
 from rosetta.common.contract_utils import register_decoder
+import cv2  
+import av
+from sensor_msgs.msg import Image
 
 
 # ---------- Helper functions ----------
@@ -62,6 +64,7 @@ def _nearest_resize_rgb(img: np.ndarray, rh: int, rw: int) -> np.ndarray:
     )
     return img[y][:, x]
 
+
 def _nearest_resize_any(img: np.ndarray, rh: int, rw: int) -> np.ndarray:
     # img is HxW or HxWxC
     H, W = img.shape[:2]
@@ -82,8 +85,8 @@ def decode_ros_image(
 ) -> np.ndarray:
     """
     Decode ROS image to numpy array in HWC format.
-    
-    For depth images: 
+
+    For depth images:
         - Returns normalized depth [0,1] for valid measurements (capped at 50m)
         - Preserves REP 117 special values: -Inf (too close), NaN (invalid), +Inf (no return)
         - 3 channels (HxWx3) replicated for LeRobot compatibility
@@ -93,11 +96,11 @@ def decode_ros_image(
     Returns:
         np.ndarray: Shape (H, W, C) with dtype float32
     """
+    
     h, w = int(msg.height), int(msg.width)
     enc = (getattr(msg, "encoding", None) or expected_encoding or "bgr8").lower()
     raw = np.frombuffer(msg.data, dtype=np.uint8)
     step = int(getattr(msg, "step", 0))
-    
 
     # --- Depth: canonical float32 meters ---
     if enc in ("32fc1", "32fc"):
@@ -112,7 +115,7 @@ def decode_ros_image(
         hwc_normalized = np.where(
             np.isfinite(hwc),
             np.clip(hwc, 0, 50) / 50,  # Cap at 50m, normalize to [0,1]
-            hwc  # Preserve NaN, -Inf, +Inf
+            hwc,  # Preserve NaN, -Inf, +Inf
         )
         hwc_3ch = np.repeat(hwc_normalized, 3, axis=-1)  # H'xW'x3
         return hwc_3ch.astype(np.float32)
@@ -134,7 +137,7 @@ def decode_ros_image(
         hwc_normalized = np.where(
             np.isfinite(hwc),
             np.clip(hwc, 0, 10) / 10,  # Cap at 50m, normalize to [0,1]
-            hwc  # Preserve NaN, -Inf, +Inf
+            hwc,  # Preserve NaN, -Inf, +Inf
         )
         hwc_3ch = np.repeat(hwc_normalized, 3, axis=-1)  # H'xW'x3
         return hwc_3ch.astype(np.float32)
@@ -153,7 +156,7 @@ def decode_ros_image(
         return hwc_3ch.astype(np.float32)
 
     # --- Color paths (unchanged behavior) ---
-    elif enc in ("rgb8", "bgr8"):
+    elif enc in ("rgb8", "bgr8", '8uc3'):
         ch = 3
         row = raw.reshape(h, step)[:, : w * ch]
         arr = row.reshape(h, w, ch)
@@ -173,9 +176,167 @@ def decode_ros_image(
         hwc_rgb = _nearest_resize_rgb(hwc_rgb, rh, rw)
 
     # Normalize to [0,1] and keep HWC format for LeRobot compatibility
-    hwc_float = hwc_rgb.astype(np.float32) / 255.0  # uint8 [0,255] -> float32 [0,1]
-
+    #hwc_float = hwc_rgb.astype(np.float32) / 255.0  # uint8 [0,255] -> float32 [0,1]
+    hwc_float = hwc_rgb.astype(np.uint8)
+    
     return hwc_float
+
+
+_decoder_state = {}
+
+def create_dummy_image(msg, spec, output_encoding='rgb8'):
+    print(f"[FoxgloveDecoder] Skipping frame  (warming up)")
+    dummy = Image()
+    dummy.header.stamp = msg.timestamp
+    dummy.header.frame_id = msg.frame_id
+
+    h, w = spec.image_resize
+    
+    print(f"[FoxgloveDecoder] Creating dummy image of size {w}x{h}")
+    dummy.height = int(h)
+    dummy.width = int(w)
+    dummy.encoding = output_encoding
+    dummy.is_bigendian = 0
+    dummy.step = dummy.width * 3
+    dummy.data = (np.zeros((dummy.height, dummy.width, 3), dtype=np.uint8)).tobytes()
+    return dummy
+
+def decode_foxglove_compressed_video(msg, spec, output_encoding='rgb8', warmup_frames=30):
+    """
+    Decode foxglove_msgs/CompressedVideo into a sensor_msgs/Image message using PyAV.
+    """
+    codec_name = getattr(msg, "format", "h264")
+    topic = spec.topic
+    
+
+    if topic not in _decoder_state:
+        try:
+            codec_ctx = av.codec.CodecContext.create(codec_name, 'r')
+            _decoder_state[topic] = {
+                'codec_ctx': codec_ctx, 
+                'prev_image': None,
+            }
+            print(f"[FoxgloveDecoder] Initialized decoder for topic {spec.topic}")
+        except Exception as e:
+            print(f"[FoxgloveDecoder] Failed to initialize decoder for {codec_name}: {e}")
+            return None
+
+    state = _decoder_state[topic]
+    codec_ctx = state['codec_ctx']
+    prev_image = state['prev_image']
+
+    
+    # Wrap raw bytes from msg.data as a PyAV packet
+    try:
+        packet = av.packet.Packet(bytes(msg.data))
+    except Exception as e:
+        print(f'Failed to create AV packet: {e}')
+        return prev_image
+    
+    try:
+        frames = codec_ctx.decode(packet)
+    except Exception as e:
+        #dummy = create_dummy_image(msg) if prev_image is None else prev_image
+        dummy = create_dummy_image(msg, spec)
+        print(f'Decode error: {e}')
+        return dummy
+    
+
+    if not frames:
+        print("[FoxgloveDecoder] No frames decoded (maybe waiting for keyframe)")
+        dummy = create_dummy_image(msg, spec)
+        return dummy
+
+    # Usually only one frame per packet
+    frame = frames[0]
+    try:
+        img_rgb = frame.to_ndarray(format='rgb24')
+        #print("valid frame")
+    except Exception as e:
+        print(f"[FoxgloveDecoder] Failed to convert frame: {e}")
+        return None
+
+    h, w, ch = img_rgb.shape
+    if ch != 3:
+        print(f"[FoxgloveDecoder] Unexpected channel count {ch}, expecting 3 (rgb24)")
+
+    ros_img = Image()
+    ros_img.header.stamp = msg.timestamp
+    ros_img.header.frame_id = msg.frame_id
+    ros_img.height = h
+    ros_img.width = w
+    ros_img.encoding = output_encoding
+    ros_img.is_bigendian = 0
+    ros_img.step = w * 3
+    ros_img.data = img_rgb.tobytes()
+
+    prev_image = ros_img
+    return ros_img
+
+
+def decode_sensor_compressed_image_png(msg, spec):
+    """
+    Decodes sensor_msgs/msg/CompressedImage stored as PNG frames, as a sensor_msgs/msg/Image.
+    """ 
+    compressed_data = np.frombuffer(msg.data, np.uint8)  #Data into numpy array
+
+    try:
+        cv_img = cv2.imdecode(compressed_data, cv2.IMREAD_COLOR) #Decode png. IMREAD_COLOR decodes in 3 channels BGR
+    except Exception as e:
+        print(f"[Decoder error] cv2.imdecode failed: {e}")
+        return None
+
+    if cv_img is None:
+       print("[Decoder error] cv2.imdecode is None. Non valid depth image.")
+       return None
+
+    img_rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB) #convert BGR to RGB
+    
+    h, w, channels = img_rgb.shape
+
+
+    ros_img = Image()
+    ros_img.header.stamp = msg.header.stamp
+    ros_img.height = h
+    ros_img.width = w
+    ros_img.encoding = "rgb8" 
+    ros_img.step = w * channels 
+    ros_img.data = img_rgb.tobytes()
+    
+    return ros_img
+    
+@register_decoder("sensor_msgs/msg/CompressedImage")
+def _dec_compressed_Image(msg,spec):
+    """ CompressedImage decoder: decode png frames, then use image decoder.
+    
+    1. Decodes the png frames using cv2
+    2. Passes the resulting image to the standard image decoder (decode_ros_image)
+    3. Returns the same normalized uint8 array as sensor_msgs/Image decoding
+    
+    """
+    decoded_image = decode_sensor_compressed_image_png(msg, spec)
+    
+    # Pass resize_hw from spec to apply any configured resize
+    normalized_image = decode_ros_image(decoded_image, spec.image_encoding, spec.image_resize)
+
+    return normalized_image
+
+@register_decoder("foxglove_msgs/msg/CompressedVideo")
+def _dec_foxglove_image(msg, spec):
+    """Foxglove CompressedVideo decoder: decode H.264 then use image decoder.
+    
+    1. Decodes the H.264 frame from the Foxglove message
+    2. Passes the resulting image to the standard image decoder (decode_ros_image)
+    3. Returns the same normalized uint8 array as sensor_msgs/Image decoding
+    
+    """
+
+    decoded_image = decode_foxglove_compressed_video(msg, spec, output_encoding='rgb8')
+    
+    # Pass resize_hw from spec to apply any configured resize
+    normalized_image = decode_ros_image(decoded_image, spec.image_encoding, spec.image_resize)
+
+    return normalized_image
 
 
 # ---------- Image decoders ----------
@@ -245,6 +406,22 @@ def _dec_imu(msg, spec):
         np.asarray([msg.linear_acceleration.x, msg.linear_acceleration.y, msg.linear_acceleration.z], dtype=np.float32)
     ])
 
+@register_decoder("sensor_msgs/msg/NavSatFix")
+def _dec_navsatfix(msg, spec):
+    """NavSatFix decoder: try dotted names first, then default (lat, lon, alt)."""
+    if spec.names:
+        return _decode_via_names(msg, spec.names)
+
+    return np.asarray(
+        [
+            msg.latitude,
+            msg.longitude,
+            msg.altitude,
+        ],
+        dtype=np.float32,
+    )
+
+
 
 @register_decoder("nav_msgs/msg/Odometry")
 def _dec_odometry(msg, spec):
@@ -269,6 +446,22 @@ def _dec_twist(msg, spec):
         np.asarray([msg.angular.x, msg.angular.y, msg.angular.z], dtype=np.float32)
     ])
 
+@register_decoder("geometry_msgs/msg/TwistStamped")
+def _dec_twist_stamped(msg, spec):
+    """
+    TwistStamped decoder.
+    """
+    if spec.names:
+        return _decode_via_names(msg, spec.names)
+
+    twist_msg = msg.twist
+
+    return np.concatenate(
+        [
+            np.asarray([twist_msg.linear.x, twist_msg.linear.y, twist_msg.linear.z], dtype=np.float32),
+            np.asarray([twist_msg.angular.x, twist_msg.angular.y, twist_msg.angular.z], dtype=np.float32),
+        ]
+    )
 
 @register_decoder("control_msgs/msg/MultiDOFCommand")
 def _dec_multidof_command(msg, spec):
@@ -281,6 +474,25 @@ def _dec_multidof_command(msg, spec):
     values_dot = np.asarray(msg.values_dot, dtype=np.float32) if msg.values_dot else np.array([], dtype=np.float32)
     return np.concatenate([values, values_dot])
 
+# ----- Motors -----
+
+@register_decoder("can_msgs/msg/MotorsRPM")
+def _dec_motors_rpm(msg, spec):
+    """MotorsRPM decoder: try dotted names first, then default (FR, RR, RL, FL)."""
+    
+    if spec.names:
+        return _decode_via_names(msg, spec.names)
+
+    return np.asarray(
+        [
+            msg.rpms_fr,
+            msg.rpms_rr,
+            msg.rpms_rl,
+            msg.rpms_fl,
+        ],
+        dtype=np.float32,
+    )
+
 
 # ---------- Generic fallback decoder ----------
 
@@ -289,11 +501,11 @@ def _decode_via_names(msg, names: List[str]) -> Optional[np.ndarray]:
     """Fallback: sample scalar fields using dotted selectors into a float32 vector."""
     if not names:
         return None
-    
+
     # Special handling for MultiDOFCommand messages
     if hasattr(msg, 'dof_names') and hasattr(msg, 'values') and hasattr(msg, 'values_dot'):
         return _decode_multidof_via_names(msg, names)
-    
+
     out: List[float] = []
     for name in names:
         try:
@@ -306,7 +518,7 @@ def _decode_via_names(msg, names: List[str]) -> Optional[np.ndarray]:
 def _decode_multidof_via_names(msg, names: List[str]) -> np.ndarray:
     """Special decoder for MultiDOFCommand messages with values. and values_dot. prefixes."""
     out: List[float] = []
-    
+
     for name in names:
         try:
             if name.startswith("values_dot."):
@@ -343,7 +555,7 @@ def _decode_multidof_via_names(msg, names: List[str]) -> np.ndarray:
                     out.append(0.0)
         except Exception:
             out.append(float("nan"))
-    
+
     return np.asarray(out, dtype=np.float32)
 
 
