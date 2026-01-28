@@ -243,7 +243,11 @@ def _close_mcap_readers_for_bag(bag_dir: Path):
     
     for key in keys_to_remove:
         _mcap_readers.pop(key, None)
-
+    
+    # Force garbage collection after closing readers
+    import gc
+    collected = gc.collect()
+    
 
 def _load_frame_from_mcap(
     bag_dir: Path,
@@ -421,6 +425,7 @@ def _purge_cache_outside_window(stream_key: Tuple[Path, str], current_idx: int, 
                 keys_to_delete.append(cache_key)
     
     # Delete frames outside window
+    deleted_count = 0
     for key in keys_to_delete:
         frame = _frame_cache.pop(key, None)
         if frame is not None and isinstance(frame, np.ndarray):
@@ -450,10 +455,12 @@ def _clear_cache_for_bag(bag_dir: Path):
         frames_by_topic[topic] = frames_by_topic.get(topic, 0) + 1
     
     # Delete all frames for this bag
+    deleted_count = 0
     for key in keys_to_delete:
         frame = _frame_cache.pop(key, None)
         if frame is not None and isinstance(frame, np.ndarray):
             del frame
+            deleted_count += 1
     
     # Report cache cleanup if frames were cleared
     if keys_to_delete:
@@ -469,6 +476,18 @@ def _clear_cache_for_bag(bag_dir: Path):
     keys_to_remove = [k for k in _last_decoded_ts.keys() if k[0] == bag_dir]
     for key in keys_to_remove:
         _last_decoded_ts.pop(key, None)
+    
+    # Force garbage collection after clearing cache
+    import gc
+    collected = gc.collect()
+    
+    # Try malloc_trim to return memory to OS
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception as e:
+        print(f"clear_cache_for_bag: malloc_trim not available: {e}")
 
 def _plan_streams(
     specs: Iterable[Any],
@@ -532,78 +551,6 @@ def _plan_streams(
             raise RuntimeError("No contract topics found in bag.")
 
     return streams, by_topic
-
-
-def _detect_image_shapes_from_bag(
-    bag_dir: Path,
-    specs: List[Any],
-) -> None:
-    """Pre-scan a bag to detect actual image shapes by reading /camera/color/camera_info.
-    Creates new SpecView objects with image_resize set for all image specs to ensure 
-    consistent sizing, including for dummy images. Uses MCAP reader format consistent 
-    with the rest of the codebase.
-    
-    Parameters
-    ----------
-    bag_dir : Path
-        Path to the bag directory to scan.
-    specs : list
-        List of SpecView objects from the contract (will be modified in-place by replacing objects).
-    """
-    # Find image specs (all image specs, regardless of whether they have resize or not)
-    image_spec_indices = [i for i, sv in enumerate(specs) if "image" in sv.key.lower()]
-    if not image_spec_indices:
-        return
-    
-    try:
-        mcap_files = list(bag_dir.glob("*.mcap"))
-        if not mcap_files:
-            print(f"[WARN] MCAP file not found in {bag_dir} for shape detection")
-            return
-        
-        mcap_path = mcap_files[0]
-        if not mcap_path.exists():
-            print(f"[WARN] MCAP file not found: {mcap_path}")
-            return
-        
-        # Open MCAP reader
-        with open(mcap_path, "rb") as f:
-            reader = make_reader(f)
-            
-            # Look for /camera/color/camera_info topic
-            camera_info_topic = "/camera/color/camera_info"
-            height = None
-            width = None
-            
-            for schema, channel, message in reader.iter_messages(topics=[camera_info_topic]):
-                # Deserialize sensor_msgs/CameraInfo message
-                ros_type = "sensor_msgs/CameraInfo"
-                msg = deserialize_message(message.data, get_message(ros_type))
-                
-                # Extract height and width from camera_info
-                height = msg.height
-                width = msg.width
-                print(f"[Auto-detect] Found camera_info: height={height}, width={width} from {camera_info_topic}")
-                
-                if height > 0 and width > 0:
-                    # Create new SpecView objects with image_resize set
-                    # This ensures all images (including dummies) have the same size
-                    for idx in image_spec_indices:
-                        sv = specs[idx]
-                        # Use replace() to create a new frozen dataclass instance with modified image_resize
-                        new_sv = replace(sv, image_resize=(height, width))
-                        specs[idx] = new_sv
-                        print(f"[Auto-detect] {sv.key}: set image_resize to ({height}, {width}) from {camera_info_topic}")
-                    
-                    break  # Found it, stop scanning
-            
-            if height is None or width is None:
-                print(f"[WARN] Could not find {camera_info_topic} in bag, skipping shape detection")
-                
-    except Exception as e:
-        print(f"[WARN] Could not pre-scan bag for image shapes: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -675,11 +622,17 @@ def export_bags_to_lerobot(
     step_ns = int(round(1e9 / fps))
     specs = list(iter_specs(contract))
 
-    # Pre-scan first bag to detect actual image shapes
-    # Detect image shapes from bag and set image_resize directly on specs
-    if bag_dirs:
-        print("[Auto-detect] Scanning first bag to detect image shapes...")
-        _detect_image_shapes_from_bag(bag_dirs[0], specs)
+    # Validate that all image specs have resize defined
+    image_specs_without_resize = [
+        sv for sv in specs 
+        if "image" in sv.key.lower() and sv.image_resize is None
+    ]
+    if image_specs_without_resize:
+        missing_keys = [sv.key for sv in image_specs_without_resize]
+        raise ValueError(
+            f"All image specs must have 'resize' defined in the contract. "
+            f"Missing resize for: {', '.join(missing_keys)}"
+        )
 
     # Features (also detect first image key as anchor)
     features: Dict[str, Dict[str, Any]] = {}
@@ -1152,9 +1105,21 @@ def export_bags_to_lerobot(
         print(
             f"  → saved {n_ticks} frames @ {int(round(fps))} FPS  | decoded_msgs={decoded_msgs}"
          )
+        # Force garbage collection and malloc_trim after save_episode to free LeRobotDataset's internal buffers
+        import gc
+        collected = gc.collect()
+        
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6")
+            libc.malloc_trim(0)
+        except Exception as e:
+            print(f"Episode {epi_idx + 1}: After save_episode, malloc_trim not available: {e}")
+                
+        # Clear cache for this episode to free memory
+        _clear_cache_for_bag(bag_dir)
         
         _close_mcap_readers_for_bag(bag_dir)
-
     
     print(f"\n[OK] Dataset root: {ds.root.resolve()}")
     if use_videos:
