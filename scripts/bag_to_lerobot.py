@@ -517,6 +517,9 @@ def _plan_streams(
     streams: Dict[str, _Stream] = {}
     by_topic: Dict[str, List[str]] = {}
     for sv in specs:
+        # Waypoints from /gps/filtered are filled manually per frame (no standard decoder)
+        if getattr(sv, "key", "") == "observation.state.waypoints":
+            continue
         if sv.topic not in tmap:
             # Derive a human-readable kind for logging without assuming SpecView internals.
             if hasattr(sv, "is_action") and sv.is_action:
@@ -724,6 +727,9 @@ def export_bags_to_lerobot(
     features["observation.state.weather"] = {"dtype": "string", "shape": (1,)}
     features["observation.state.time_of_day"] = {"dtype": "string", "shape": (1,)}
 
+    # Waypoints from /gps/filtered (sensor_msgs/NavSatFix): each waypoint is (longitude, latitude)
+    features["observation.state.waypoints"] = {"dtype": "float32", "shape": (1, 2)}
+
     # Dataset
     ds = LeRobotDataset.create(
         repo_id=repo_id,
@@ -829,7 +835,18 @@ def export_bags_to_lerobot(
             continue
 
         tmap = _topic_type_map(reader)
-        
+
+        # GPS waypoints from /gps/filtered (required in bag)
+        gps_topic = "/gps/filtered"
+        if gps_topic not in tmap:
+            raise RuntimeError(
+                f"Topic {gps_topic!r} is required but not found in bag {bag_dir}. "
+                "Ensure the bag was recorded with /gps/filtered."
+            )
+        gps_ts: List[int] = []
+        gps_lon: List[float] = []
+        gps_lat: List[float] = []
+
         # Plan once - handle multiple observation.state specs and action specs
         streams, by_topic = _plan_streams(specs, tmap)
         
@@ -850,6 +867,18 @@ def export_bags_to_lerobot(
         while reader.has_next():
             topic, data, bag_ns = reader.read_next()
             message_counter += 1
+
+            # Decode GPS from /gps/filtered (sensor_msgs/NavSatFix) → waypoints (lon, lat)
+            if topic == gps_topic:
+                try:
+                    msg = deserialize_message(data, get_message(tmap[topic]))
+                    ts_gps = stamp_from_header_ns(msg) or int(bag_ns)
+                    gps_ts.append(ts_gps)
+                    gps_lon.append(float(msg.longitude))
+                    gps_lat.append(float(msg.latitude))
+                except Exception as e:
+                    print(f"[WARN] Failed to decode GPS message: {e}")
+
             if topic not in by_topic:
                 continue
             for key in by_topic[topic]:
@@ -951,6 +980,20 @@ def export_bags_to_lerobot(
             )
             
         print("Resampling done")
+
+        # Resample GPS (lon, lat) to frame ticks (closest sample per tick) → waypoints
+        gps_resampled_lon: Optional[List[float]] = None
+        gps_resampled_lat: Optional[List[float]] = None
+        if gps_ts and len(gps_ts) > 0:
+            gps_ts_np = np.asarray(gps_ts, dtype=np.int64)
+            gps_resampled_lon = resample(
+                "closest", gps_ts_np, gps_lon, ticks_ns, step_ns, 0
+            )
+            gps_resampled_lat = resample(
+                "closest", gps_ts_np, gps_lat, ticks_ns, step_ns, 0
+            )
+            print(f"  [GPS] Resampled {len(gps_ts)} /gps/filtered messages to {n_ticks} frames (waypoints: lon, lat)")
+
         # Write frames
         print(f"Processing {n_ticks} frames...")
 
@@ -1021,7 +1064,8 @@ def export_bags_to_lerobot(
                     "observation.state.road_type",
                     "observation.state.surface",
                     "observation.state.weather",
-                    "observation.state.time_of_day"
+                    "observation.state.time_of_day",
+                    "observation.state.waypoints",
                 ]:
                     continue
                     
@@ -1095,6 +1139,16 @@ def export_bags_to_lerobot(
             frame["observation.state.weather"] = str(weather) if weather and str(weather).strip() else ""
             frame["observation.state.time_of_day"] = str(time_of_day) if time_of_day and str(time_of_day).strip() else ""
             
+            # Waypoints (lon, lat) from /gps/filtered, resampled to this frame
+            if gps_resampled_lon is not None and gps_resampled_lat is not None:
+                frame["observation.state.waypoints"] = np.array(
+                    [[gps_resampled_lon[i], gps_resampled_lat[i]]], dtype=np.float32
+                )
+            else:
+                frame["observation.state.waypoints"] = np.array(
+                    [[np.nan, np.nan]], dtype=np.float32
+                )
+
             # Debug: log first frame values to verify they're being set correctly
             if i == 0:
                 print(f"[Frame 0] Setting observation.state.* values: road_type='{frame['observation.state.road_type']}', surface='{frame['observation.state.surface']}', weather='{frame['observation.state.weather']}', time_of_day='{frame['observation.state.time_of_day']}'")

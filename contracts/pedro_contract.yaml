@@ -31,6 +31,14 @@ observations:
     align: {strategy: closest, stamp: header, tol_ms: 150}
     qos: {reliability: best_effort, history: keep_last, depth: 50}
 
+  - key: observation.state.waypoints
+    topic: /gps/filtered
+    type: sensor_msgs/msg/NavSatFix
+    selector:
+      names: [longitude, latitude]
+    align: {strategy: closest, stamp: header, tol_ms: 150}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
 
 actions:
   - key: action
