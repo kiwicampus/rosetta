@@ -192,7 +192,7 @@ def create_dummy_image(msg, spec, output_encoding='rgb8'):
 
     h, w = spec.image_resize
     
-    print(f"[FoxgloveDecoder] Creating dummy image of size {w}x{h}")
+    # print(f"[FoxgloveDecoder] Creating dummy image of size {w}x{h}")
     dummy.height = int(h)
     dummy.width = int(w)
     dummy.encoding = output_encoding

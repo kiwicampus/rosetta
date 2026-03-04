@@ -91,7 +91,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import yaml
 import time
-import sys
 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
@@ -102,22 +101,6 @@ from mcap.reader import make_reader
 import bisect
 # ---- LeRobot
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-# ---- Anonymizer (from submodule)
-# Path: ros2_workspace/src/utils/anonymizer
-ANONYMIZER_PATH = Path(__file__).parent.parent.parent / "utils" / "anonymizer"
-if ANONYMIZER_PATH.exists():
-    sys.path.insert(0, str(ANONYMIZER_PATH))
-    try:
-        from anonymizer.anonymization import AnonymizerOnnx
-        from anonymizer.detection import Detector
-        from anonymizer.obfuscation import Obfuscator
-        ANONYMIZER_AVAILABLE = True
-    except ImportError as e:
-        print(f"[WARN] Failed to import anonymizer: {e}")
-        ANONYMIZER_AVAILABLE = False
-else:
-    ANONYMIZER_AVAILABLE = False
 
 # ---- Shared core (ONLY these two)
 from rosetta.common.contract_utils import (
@@ -135,96 +118,6 @@ from rosetta.common.contract_utils import (
 
 # Import decoders to register them
 import rosetta.common.decoders  # noqa: F401
-
-# ---------------------------------------------------------------------------
-
-
-def _get_onnx_providers(ort, weights_path: Path) -> List[Any]:
-    """Resolve ONNX providers: use CUDA only if it actually works (avoids driver/runtime mismatch spam)."""
-    if not weights_path.exists():
-        return ["CPUExecutionProvider"]
-    
-    # Try CUDA-only first; suppress ONNX Runtime's error spam during test
-    import sys
-    import io
-    cuda_providers = [("CUDAExecutionProvider", {"device_id": 0})]
-    
-    # Temporarily redirect stderr to suppress ONNX Runtime's error messages during test
-    old_stderr = sys.stderr
-    stderr_capture = io.StringIO()
-    try:
-        sys.stderr = stderr_capture
-        session = ort.InferenceSession(str(weights_path), providers=cuda_providers)
-        sys.stderr = old_stderr
-        # If we get here, CUDA worked
-        print("[INFO] Using CUDA for anonymization")
-        return cuda_providers + ["CPUExecutionProvider"]
-    except Exception as e:
-        sys.stderr = old_stderr
-        stderr_output = stderr_capture.getvalue()
-        # Check if it's a CUDA compatibility issue
-        if "804" in stderr_output or "forward compatibility" in stderr_output or "GPU=-1" in stderr_output:
-            print("[INFO] CUDA unavailable (driver/runtime mismatch or no GPU), using CPU for anonymization")
-        else:
-            msg = str(e).split("\n")[0] if e else ""
-            print(f"[WARN] CUDA init failed: {msg}")
-        return ["CPUExecutionProvider"]
-
-
-def _init_anonymizer(weights_path: Path, face_threshold: float, plate_threshold: float, obfuscation_params: str) -> Optional[Any]:
-    """Initialize the anonymizer if available.
-    
-    Parameters
-    ----------
-    weights_path : Path
-        Path to directory containing anonymizer weights (face.onnx, plate.onnx)
-    face_threshold : float
-        Face detection confidence threshold
-    plate_threshold : float
-        License plate detection confidence threshold
-    obfuscation_params : str
-        Comma-separated string: kernel_size,sigma,box_kernel_size
-        
-    Returns
-    -------
-    AnonymizerOnnx instance or None if not available
-    """
-    if not ANONYMIZER_AVAILABLE:
-        return None
-    
-    try:
-        import onnxruntime as ort
-        
-        # Parse obfuscation parameters
-        kernel_size, sigma, box_kernel_size = obfuscation_params.split(',')
-        obfuscator = Obfuscator(
-            kernel_size=int(kernel_size),
-            sigma=float(sigma),
-            box_kernel_size=int(box_kernel_size)
-        )
-        
-        # Setup ONNX providers: try CUDA first (validate it works), else CPU
-        face_onnx = weights_path / "face.onnx"
-        providers = _get_onnx_providers(ort, face_onnx)
-        
-        # Initialize detectors
-        detectors = {
-            'face': Detector(kind='face', weights_path=str(weights_path), providers=providers),
-            'plate': Detector(kind='plate', weights_path=str(weights_path), providers=providers)
-        }
-        
-        detection_thresholds = {
-            'face': face_threshold,
-            'plate': plate_threshold
-        }
-        
-        anonymizer = AnonymizerOnnx(detectors=detectors, obfuscator=obfuscator)
-        return anonymizer, detection_thresholds
-        
-    except Exception as e:
-        print(f"[WARN] Failed to initialize anonymizer: {e}")
-        return None
-
 
 # ---------------------------------------------------------------------------
 
@@ -677,11 +570,6 @@ def export_bags_to_lerobot(
     data_mb: int = 100,
     video_mb: int = 500,
     timestamp_source: str = "contract",  # 'contract' | 'receive' | 'header' |
-    anonymize: bool = True,
-    anonymize_weights: Optional[Path] = None,
-    anonymize_face_threshold: float = 0.3,
-    anonymize_plate_threshold: float = 0.3,
-    anonymize_kernel: str = "21,2,9",
 ) -> None:
 
     """Convert bag directories into a LeRobot v3 dataset under `out_root`.
@@ -729,22 +617,6 @@ def export_bags_to_lerobot(
       so your exported dataset matches online inputs exactly.
     - Image coercion uses shared utilities for consistent preprocessing.
     """
-    # Initialize anonymizer if requested (default when weights path exists)
-    anonymizer_obj = None
-    detection_thresholds = None
-    if anonymize and anonymize_weights is not None and Path(anonymize_weights).exists():
-        result = _init_anonymizer(
-            weights_path=Path(anonymize_weights),
-            face_threshold=anonymize_face_threshold,
-            plate_threshold=anonymize_plate_threshold,
-            obfuscation_params=anonymize_kernel
-        )
-        if result is not None:
-            anonymizer_obj, detection_thresholds = result
-            print(f"[INFO] Anonymization enabled: face_threshold={anonymize_face_threshold}, plate_threshold={anonymize_plate_threshold}")
-        else:
-            print("[WARN] Anonymization requested but init failed (submodule or weights). Continuing without anonymization.")
-    
     # Contract + specs
     contract = load_contract(contract_path)
     fps = int(contract.rate_hz)
@@ -1124,7 +996,6 @@ def export_bags_to_lerobot(
 
         # Write frames
         print(f"Processing {n_ticks} frames...")
-        collected_frames = []
 
         for i in range(n_ticks):
             # Print progress every 10% or every 100 frames, whichever is more frequent
@@ -1282,24 +1153,6 @@ def export_bags_to_lerobot(
             if i == 0:
                 print(f"[Frame 0] Setting observation.state.* values: road_type='{frame['observation.state.road_type']}', surface='{frame['observation.state.surface']}', weather='{frame['observation.state.weather']}', time_of_day='{frame['observation.state.time_of_day']}'")
             
-            collected_frames.append(frame)
-        
-        # Batch anonymization: apply to all collected image frames at once
-        image_keys = [k for k, ft in features.items() if ft.get("dtype") in ("video", "image")]
-        if anonymizer_obj is not None and detection_thresholds is not None and image_keys:
-            print(f"  Anonymizing {len(collected_frames)} frames × {len(image_keys)} images in batch...")
-            for i, frame in enumerate(collected_frames):
-                for name in image_keys:
-                    arr = frame.get(name)
-                    if arr is None or not isinstance(arr, np.ndarray):
-                        continue
-                    try:
-                        anonymized_arr, _ = anonymizer_obj.anonymize_image(arr, detection_thresholds)
-                        frame[name] = anonymized_arr
-                    except Exception as e:
-                        print(f"[WARN] Failed to anonymize frame {i} {name}: {e}")
-        
-        for frame in collected_frames:
             ds.add_frame(frame)
 
         ds.save_episode()
@@ -1363,12 +1216,6 @@ def parse_args() -> argparse.Namespace:
             "'contract' (per-spec), 'bag' (receive), or 'header' (message header)."
         ),
     )
-    # Anonymization arguments (on by default when weights path exists)
-    ap.add_argument("--no-anonymize", action="store_true", dest="no_anonymize", help="Disable anonymization of faces and license plates")
-    ap.add_argument("--anonymize-weights", type=str, default=None, help="Path to anonymizer weights directory (default: ros2_workspace/src/utils/weights)")
-    ap.add_argument("--anonymize-face-threshold", type=float, default=0.3, help="Face detection threshold (default: 0.3)")
-    ap.add_argument("--anonymize-plate-threshold", type=float, default=0.3, help="License plate detection threshold (default: 0.3)")
-    ap.add_argument("--anonymize-kernel", type=str, default="21,2,9", help="Obfuscation kernel parameters: kernel_size,sigma,box_kernel_size (default: 21,2,9)")
     return ap.parse_args()
 
 
@@ -1451,16 +1298,6 @@ def main() -> None:
     
     print(f"[Output] Dataset will be saved to: {final_out_path}")
     
-    # Anonymization: on by default unless --no-anonymize; use default weights path if not set
-    anonymize = not getattr(args, "no_anonymize", False)
-    anonymize_weights_path = None
-    if anonymize:
-        anonymize_weights_path = Path(args.anonymize_weights) if args.anonymize_weights else (ANONYMIZER_PATH.parent / "weights")
-        if not anonymize_weights_path.exists():
-            print(f"[INFO] Anonymization disabled: weights path not found ({anonymize_weights_path})")
-            anonymize = False
-            anonymize_weights_path = None
-    
     export_bags_to_lerobot(
         bag_dirs=bag_dirs,
         contract_path=Path(args.contract),
@@ -1473,11 +1310,6 @@ def main() -> None:
         data_mb=args.data_mb,
         video_mb=args.video_mb,
         timestamp_source=args.timestamp,
-        anonymize=anonymize,
-        anonymize_weights=anonymize_weights_path,
-        anonymize_face_threshold=args.anonymize_face_threshold,
-        anonymize_plate_threshold=args.anonymize_plate_threshold,
-        anonymize_kernel=args.anonymize_kernel,
     )
 
 
