@@ -728,7 +728,7 @@ def export_bags_to_lerobot(
     features["observation.state.time_of_day"] = {"dtype": "string", "shape": (1,)}
 
     # Waypoints from /gps/filtered (sensor_msgs/NavSatFix): each waypoint is (longitude, latitude)
-    features["observation.state.waypoints"] = {"dtype": "float32", "shape": (1, 2)}
+    features["observation.state.waypoints"] = {"dtype": "float32", "shape": (2,)}
 
     # Dataset
     ds = LeRobotDataset.create(
@@ -1142,11 +1142,11 @@ def export_bags_to_lerobot(
             # Waypoints (lon, lat) from /gps/filtered, resampled to this frame
             if gps_resampled_lon is not None and gps_resampled_lat is not None:
                 frame["observation.state.waypoints"] = np.array(
-                    [[gps_resampled_lon[i], gps_resampled_lat[i]]], dtype=np.float32
+                    [gps_resampled_lon[i], gps_resampled_lat[i]], dtype=np.float32
                 )
             else:
                 frame["observation.state.waypoints"] = np.array(
-                    [[np.nan, np.nan]], dtype=np.float32
+                    [np.nan, np.nan], dtype=np.float32
                 )
 
             # Debug: log first frame values to verify they're being set correctly
