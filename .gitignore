@@ -233,3 +233,7 @@ __marimo__/
 # Temporary files or user-specific configurations
 .DS_Store # macOS
 Thumbs.db # Windows
+
+# Anonymization models
+scripts/models/*
+scripts/test_imgs/*
