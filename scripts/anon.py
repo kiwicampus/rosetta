@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Blur license plates and faces in images. Input: dir (recursive), multiple files, or single file."""
 import argparse
-import threading
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
+import torch
 import cv2
 from tqdm import tqdm
 
@@ -41,26 +42,20 @@ def process_one(
         if img is None:
             return f"Failed to read {in_path}"
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # Run both models in parallel (inference releases GIL; threading avoids executor overhead)
-        plate_results, face_results = [None], [None]
+        # Run sequentially to avoid GPU OOM (both models compete for ~640MB each in NMS)
+        plate_results = plate_model.predict_from_array(img)
+        face_results = face_model.predict_from_array(img)
+        plate_results = plate_results or {"bboxes": []}
+        face_results = face_results or {"bboxes": []}
 
-        def run_plate():
-            plate_results[0] = plate_model.predict_from_array(img)
+        def _iter_bboxes(r):
+            b = r.get("bboxes", [])
+            return b.int() if hasattr(b, "int") else b
 
-        def run_face():
-            face_results[0] = face_model.predict_from_array(img)
-
-        t1 = threading.Thread(target=run_plate)
-        t2 = threading.Thread(target=run_face)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-        plate_results, face_results = plate_results[0], face_results[0]
-        for bbox in plate_results["bboxes"].int():
-            _blur_roi(img, bbox.tolist())
-        for bbox in face_results["bboxes"].int():
-            _blur_roi(img, bbox.tolist())
+        for bbox in _iter_bboxes(plate_results):
+            _blur_roi(img, bbox.tolist() if hasattr(bbox, "tolist") else list(bbox))
+        for bbox in _iter_bboxes(face_results):
+            _blur_roi(img, bbox.tolist() if hasattr(bbox, "tolist") else list(bbox))
         out_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(out_path), cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
         return None
@@ -102,14 +97,15 @@ def main():
     parser.add_argument("-j", "--jobs", type=int, default=None, required=False, help="Thread count (default: min(32, cpu_count+4))")
     parser.add_argument("--plate-model", default=str(PLATE_MODEL_PATH), required=False, help="Plate model path (default: scripts/models/plate.pt)")
     parser.add_argument("--face-model", default=str(FACE_MODEL_PATH), required=False, help="Face model path (default: scripts/models/face.pt)")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto", help="Device for inference (default: auto)")
     args = parser.parse_args()
 
     tic = time.perf_counter()
     # Load both models in parallel
     dummy = np.zeros((100, 100, 3), dtype=np.uint8)
     with ThreadPoolExecutor(max_workers=2) as ex:
-        plate_fut = ex.submit(PlatePredictor, args.plate_model)
-        face_fut = ex.submit(FacePredictor, args.face_model)
+        plate_fut = ex.submit(PlatePredictor, args.plate_model, 0.5, args.device)
+        face_fut = ex.submit(FacePredictor, args.face_model, 0.5, args.device)
         plate_model = plate_fut.result()
         face_model = face_fut.result()
     # Eager warmup (avoids per-thread session init races)
@@ -121,8 +117,13 @@ def main():
         print("No images to process.")
         return
 
+    jobs = args.jobs
+    if jobs is None:
+        use_gpu = args.device == "cuda" or (args.device == "auto" and torch.cuda.is_available())
+        jobs = 1 if use_gpu else min(32, (os.cpu_count() or 4) + 4)
+
     errors = []
-    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
         futures = {
             ex.submit(process_one, plate_model, face_model, inp, out): inp
             for inp, out in pairs
