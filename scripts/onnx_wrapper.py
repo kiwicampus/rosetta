@@ -19,10 +19,18 @@ class OnnxRuntimeWrapper(nn.Module):
         if self._session is None:
             opts = ort.SessionOptions()
             opts.log_severity_level = 3  # Errors only (suppress Memcpy warnings)
+            # kSameAsRequested avoids BFC arena fragmentation that causes "Failed to allocate 256" on Loop (NMS) nodes.
+            # cudnn_conv_use_max_workspace=0 limits cuDNN workspace to 32MB to reduce peak memory.
+            cuda_opts = {
+                "arena_extend_strategy": "kSameAsRequested",
+                "cudnn_conv_use_max_workspace": "0",
+            }
+            providers = [
+                ("CUDAExecutionProvider", cuda_opts),
+                "CPUExecutionProvider",
+            ]
             self._session = ort.InferenceSession(
-                self.onnx_path,
-                opts,
-                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+                self.onnx_path, opts, providers=providers
             )
             provider = self._session.get_providers()[0]
             device = "GPU" if "CUDA" in provider else "CPU"
@@ -56,8 +64,16 @@ class OnnxRuntimeWrapper(nn.Module):
         try:
             outputs = sess.run(None, feed)
         except Exception as e:
-            if "allocate" in str(e).lower():
-                outputs = self.session_cpu.run(None, feed)
+            if "allocate" in str(e).lower() or "memory" in str(e).lower():
+                sess_cpu = getattr(self, "_session_cpu", None)
+                if sess_cpu is None:
+                    opts = ort.SessionOptions()
+                    opts.log_severity_level = 3
+                    sess_cpu = ort.InferenceSession(
+                        self.onnx_path, opts, providers=["CPUExecutionProvider"]
+                    )
+                    self._session_cpu = sess_cpu
+                outputs = sess_cpu.run(None, feed)
             else:
                 raise
         out = [torch.from_numpy(o) for o in outputs]
@@ -70,7 +86,8 @@ def _load_image_rgb(image_path: str) -> "np.ndarray":
     return img.permute(1, 2, 0).numpy()
 
 
-_MAX_INFER_DIM = 800  # Cap to avoid NMS OOM; 1200px images bypassed 1280, causing fragmentation on re-runs
+# Cap to avoid NMS OOM. 416 with sequential loading (one model at a time) fits 6GB GPUs.
+_MAX_INFER_DIM = 416
 
 
 def _run_tf_od(

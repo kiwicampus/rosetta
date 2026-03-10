@@ -84,10 +84,12 @@ Notes
 """
 
 import argparse
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import yaml
 import time
@@ -118,6 +120,12 @@ from rosetta.common.contract_utils import (
 
 # Import decoders to register them
 import rosetta.common.decoders  # noqa: F401
+
+# Ensure scripts dir is on path for anon/onnx_wrapper imports
+_scripts_dir = Path(__file__).resolve().parent
+if str(_scripts_dir) not in sys.path:
+    sys.path.insert(0, str(_scripts_dir))
+from anon import anonymize_frames_batch, create_anonymizer
 
 # ---------------------------------------------------------------------------
 
@@ -570,6 +578,8 @@ def export_bags_to_lerobot(
     data_mb: int = 100,
     video_mb: int = 500,
     timestamp_source: str = "contract",  # 'contract' | 'receive' | 'header' |
+    use_anon: bool = True,
+    anon_batch_size: int = 64,
 ) -> None:
 
     """Convert bag directories into a LeRobot v3 dataset under `out_root`.
@@ -603,6 +613,10 @@ def export_bags_to_lerobot(
         - "contract": Use bag time, unless spec.stamp_src == "header" or spec.stamp_src == "foxglove"
         - "receive":  Always use bag receive time.
         - "header":   Prefer header stamp; fall back to bag receive time.
+    use_anon : bool, default True
+        If True, anonymize faces and plates in images.
+    anon_batch_size : int, default 64
+        Number of frames to anonymize in one batch.
 
     Raises
     ------
@@ -764,6 +778,13 @@ def export_bags_to_lerobot(
         if ft["dtype"] in ("video", "image", "float32", "float64", "string")
     ]
     shapes = {k: tuple(features[k]["shape"]) for k in write_keys}
+    image_keys = [k for k in write_keys if features[k]["dtype"] in ("video", "image")]
+
+    anonymizer = None
+    if use_anon and image_keys:
+        print("[Anon] Loading models...")
+        anonymizer = create_anonymizer(device="auto", sequential=True)
+        print(f"[Anon] Batch size={anon_batch_size}, image keys={image_keys}")
 
     # Episodes
     total_episodes = len(bag_dirs)
@@ -994,8 +1015,9 @@ def export_bags_to_lerobot(
             )
             print(f"  [GPS] Resampled {len(gps_ts)} /gps/filtered messages to {n_ticks} frames (waypoints: lon, lat)")
 
-        # Write frames
+        # Phase 1: Collect all frames
         print(f"Processing {n_ticks} frames...")
+        all_frames: List[Dict[str, Any]] = []
 
         for i in range(n_ticks):
             # Print progress every 10% or every 100 frames, whichever is more frequent
@@ -1153,7 +1175,18 @@ def export_bags_to_lerobot(
             if i == 0:
                 print(f"[Frame 0] Setting observation.state.* values: road_type='{frame['observation.state.road_type']}', surface='{frame['observation.state.surface']}', weather='{frame['observation.state.weather']}', time_of_day='{frame['observation.state.time_of_day']}'")
             
-            ds.add_frame(frame)
+            all_frames.append(frame)
+
+        # Phase 2: Anonymize (if enabled) then add all frames
+        if anonymizer:
+            for batch_start in range(0, len(all_frames), anon_batch_size):
+                batch = all_frames[batch_start : batch_start + anon_batch_size]
+                anonymize_frames_batch(batch, image_keys, *anonymizer)
+                for f in batch:
+                    ds.add_frame(f)
+        else:
+            for f in all_frames:
+                ds.add_frame(f)
 
         ds.save_episode()
         print(
@@ -1216,6 +1249,8 @@ def parse_args() -> argparse.Namespace:
             "'contract' (per-spec), 'bag' (receive), or 'header' (message header)."
         ),
     )
+    ap.add_argument("--anon", action="store_true", help="Anonymize faces and plates in images (overwrites in place)")
+    ap.add_argument("--anon-batch-size", type=int, default=64, help="Frames per anonymization batch (default: 64)")
     return ap.parse_args()
 
 
@@ -1310,6 +1345,8 @@ def main() -> None:
         data_mb=args.data_mb,
         video_mb=args.video_mb,
         timestamp_source=args.timestamp,
+        use_anon=args.anon,
+        anon_batch_size=args.anon_batch_size,
     )
 
 
