@@ -1249,7 +1249,8 @@ def parse_args() -> argparse.Namespace:
             "'contract' (per-spec), 'bag' (receive), or 'header' (message header)."
         ),
     )
-    ap.add_argument("--anon", action="store_true", help="Anonymize faces and plates in images (overwrites in place)")
+    ap.add_argument("--anon", action="store_true", default=True, help="Anonymize faces and plates (default: True)")
+    ap.add_argument("--no-anon", dest="anon", action="store_false", help="Disable anonymization")
     ap.add_argument("--anon-batch-size", type=int, default=64, help="Frames per anonymization batch (default: 64)")
     return ap.parse_args()
 
