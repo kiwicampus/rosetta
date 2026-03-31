@@ -570,6 +570,8 @@ def export_bags_to_lerobot(
     data_mb: int = 100,
     video_mb: int = 500,
     timestamp_source: str = "contract",  # 'contract' | 'receive' | 'header' |
+    anonymize: bool = False,
+    anonymize_gpu: bool = True,
 ) -> None:
 
     """Convert bag directories into a LeRobot v3 dataset under `out_root`.
@@ -603,6 +605,14 @@ def export_bags_to_lerobot(
         - "contract": Use bag time, unless spec.stamp_src == "header" or spec.stamp_src == "foxglove"
         - "receive":  Always use bag receive time.
         - "header":   Prefer header stamp; fall back to bag receive time.
+    anonymize : bool, default False
+        If True, anonymize faces and license plates in all image frames
+        before writing them to the dataset.  Uses the offline-anonymization
+        submodule via a persistent TF1.15 daemon (loaded once, shared across
+        all episodes).
+    anonymize_gpu : bool, default True
+        When ``anonymize=True``, whether to run inference on GPU.  Pass
+        ``False`` on CPU-only machines.
 
     Raises
     ------
@@ -764,6 +774,23 @@ def export_bags_to_lerobot(
         if ft["dtype"] in ("video", "image", "float32", "float64", "string")
     ]
     shapes = {k: tuple(features[k]["shape"]) for k in write_keys}
+
+    # Image keys used for anonymization (pre-computed once per run).
+    image_write_keys = [
+        k for k, ft in features.items() if ft["dtype"] in ("video", "image")
+    ]
+
+    # Initialise the anonymizer daemon ONCE here so the model is loaded
+    # a single time and reused across all episodes.
+    _anonymizer = None
+    if anonymize:
+        from rosetta.common.anonymizer import FrameAnonymizer
+        _anonymizer = FrameAnonymizer.get_instance(gpu=anonymize_gpu)
+        print(
+            f"[Anonymizer] Initialized. Will anonymize {len(image_write_keys)} "
+            f"image stream(s) per episode: {image_write_keys}",
+            flush=True,
+        )
 
     # Episodes
     total_episodes = len(bag_dirs)
@@ -997,6 +1024,12 @@ def export_bags_to_lerobot(
         # Write frames
         print(f"Processing {n_ticks} frames...")
 
+        # When anonymizing: buffer all assembled frames, then batch-anonymize
+        # image fields in one shot before calling add_frame.  This keeps the
+        # tick loop unchanged and maximises GPU throughput (one inference pass
+        # per episode instead of one per frame).
+        _episode_frame_buffer: Optional[List[Dict]] = [] if anonymize else None
+
         for i in range(n_ticks):
             # Print progress every 10% or every 100 frames, whichever is more frequent
             if i == 0 or (i + 1) % max(1, min(100, n_ticks // 10)) == 0 or (i + 1) == n_ticks:
@@ -1152,8 +1185,25 @@ def export_bags_to_lerobot(
             # Debug: log first frame values to verify they're being set correctly
             if i == 0:
                 print(f"[Frame 0] Setting observation.state.* values: road_type='{frame['observation.state.road_type']}', surface='{frame['observation.state.surface']}', weather='{frame['observation.state.weather']}', time_of_day='{frame['observation.state.time_of_day']}'")
-            
-            ds.add_frame(frame)
+
+            if _episode_frame_buffer is not None:
+                _episode_frame_buffer.append(frame)
+            else:
+                ds.add_frame(frame)
+
+        # ---------------------------------------------------------------
+        # Anonymize episode frames (batch mode) and flush to dataset
+        # ---------------------------------------------------------------
+        if _episode_frame_buffer is not None and _anonymizer is not None:
+            print(
+                f"  [Anonymizer] Anonymizing {len(_episode_frame_buffer)} frames "
+                f"across {len(image_write_keys)} camera stream(s) …",
+                flush=True,
+            )
+            _anonymizer.anonymize_episode(_episode_frame_buffer, image_write_keys)
+            print("  [Anonymizer] Done. Writing frames to dataset …", flush=True)
+            for _frame in _episode_frame_buffer:
+                ds.add_frame(_frame)
 
         ds.save_episode()
         print(
@@ -1215,6 +1265,22 @@ def parse_args() -> argparse.Namespace:
             "Which time base to use when resampling: "
             "'contract' (per-spec), 'bag' (receive), or 'header' (message header)."
         ),
+    )
+    ap.add_argument(
+        "--anonymize",
+        action="store_true",
+        default=False,
+        help=(
+            "Anonymize faces and license plates in all image frames before "
+            "saving to the dataset.  Requires the offline-anonymization submodule "
+            "and the anon_env conda environment (see README for setup)."
+        ),
+    )
+    ap.add_argument(
+        "--no-anonymize-gpu",
+        action="store_true",
+        default=False,
+        help="Disable GPU for anonymization (forces CPU inference). Default: GPU enabled.",
     )
     return ap.parse_args()
 
@@ -1310,7 +1376,14 @@ def main() -> None:
         data_mb=args.data_mb,
         video_mb=args.video_mb,
         timestamp_source=args.timestamp,
+        anonymize=args.anonymize,
+        anonymize_gpu=not args.no_anonymize_gpu,
     )
+
+    if args.anonymize:
+        # Cleanly shut down the daemon (sends poison pill, waits for exit).
+        from rosetta.common.anonymizer import FrameAnonymizer
+        FrameAnonymizer.get_instance().shutdown()
 
 
 if __name__ == "__main__":
