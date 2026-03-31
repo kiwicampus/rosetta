@@ -793,8 +793,12 @@ def export_bags_to_lerobot(
         )
 
     # Episodes
+    import time as _time
     total_episodes = len(bag_dirs)
+    _run_t0 = _time.perf_counter()
+    _all_episode_stats: List[Dict] = []
     for epi_idx, bag_dir in enumerate(bag_dirs):
+        _episode_t0 = _time.perf_counter()
         print(f"Processing episode {epi_idx + 1} of {total_episodes}")
         print(f"[Episode {epi_idx}] {bag_dir}")
 
@@ -1194,14 +1198,20 @@ def export_bags_to_lerobot(
         # ---------------------------------------------------------------
         # Anonymize episode frames (batch mode) and flush to dataset
         # ---------------------------------------------------------------
+        _anon_elapsed = 0.0
         if _episode_frame_buffer is not None and _anonymizer is not None:
             print(
                 f"  [Anonymizer] Anonymizing {len(_episode_frame_buffer)} frames "
                 f"across {len(image_write_keys)} camera stream(s) …",
                 flush=True,
             )
+            _anon_t0 = _time.perf_counter()
             _anonymizer.anonymize_episode(_episode_frame_buffer, image_write_keys)
-            print("  [Anonymizer] Done. Writing frames to dataset …", flush=True)
+            _anon_elapsed = _time.perf_counter() - _anon_t0
+            print(
+                f"  [Anonymizer] Done in {_anon_elapsed:.1f}s. Writing frames to dataset …",
+                flush=True,
+            )
             for _frame in _episode_frame_buffer:
                 ds.add_frame(_frame)
 
@@ -1222,18 +1232,111 @@ def export_bags_to_lerobot(
                 
         # Clear cache for this episode to free memory
         _clear_cache_for_bag(bag_dir)
-        
+
         _close_mcap_readers_for_bag(bag_dir)
-    
-    print(f"\n[OK] Dataset root: {ds.root.resolve()}")
-    if use_videos:
-        print("  - videos/<image_key>/chunk-*/file-*.mp4")
-    else:
-        print("  - images/*/*.png")
-    print("  - data/chunk-*/file-*.parquet")
+
+        _episode_elapsed = _time.perf_counter() - _episode_t0
+        print(
+            f"  [Timing] Episode {epi_idx + 1}/{total_episodes} done in "
+            f"{_episode_elapsed:.1f}s ({_episode_elapsed / 60:.1f} min)"
+        )
+        _all_episode_stats.append(
+            {
+                "idx": epi_idx + 1,
+                "bag": bag_dir.name,
+                "frames": n_ticks,
+                "decoded_msgs": decoded_msgs,
+                "anon_s": _anon_elapsed,
+                "total_s": _episode_elapsed,
+            }
+        )
+
+    _run_elapsed = _time.perf_counter() - _run_t0
+
+    # -------------------------------------------------------------------
+    # Final summary
+    # -------------------------------------------------------------------
+    _W = 80
+    print("\n" + "═" * _W)
+    print("  CONVERSION SUMMARY")
+    print("═" * _W)
+
+    # Per-episode table
+    _col = [6, 28, 8, 12, 10, 10]
+    _hdr = ["Ep", "Bag", "Frames", "Msgs", "Anon (s)", "Total (s)"]
+    _row_fmt = "  {:<{c0}}  {:<{c1}}  {:>{c2}}  {:>{c3}}  {:>{c4}}  {:>{c5}}"
     print(
-        "  - meta/info.json, meta/tasks.parquet, meta/stats.json, meta/episodes/*/*.parquet"
+        _row_fmt.format(*_hdr, c0=_col[0], c1=_col[1], c2=_col[2], c3=_col[3], c4=_col[4], c5=_col[5])
     )
+    print("  " + "-" * (_W - 2))
+    _total_frames = 0
+    _total_msgs = 0
+    _total_anon_s = 0.0
+    for _s in _all_episode_stats:
+        _anon_cell = f"{_s['anon_s']:.1f}" if _s["anon_s"] > 0 else "—"
+        print(
+            _row_fmt.format(
+                _s["idx"],
+                _s["bag"][:_col[1]],
+                _s["frames"],
+                _s["decoded_msgs"],
+                _anon_cell,
+                f"{_s['total_s']:.1f}",
+                c0=_col[0], c1=_col[1], c2=_col[2], c3=_col[3], c4=_col[4], c5=_col[5],
+            )
+        )
+        _total_frames += _s["frames"]
+        _total_msgs += _s["decoded_msgs"]
+        _total_anon_s += _s["anon_s"]
+
+    print("  " + "─" * (_W - 2))
+
+    # Totals row
+    _anon_total_cell = f"{_total_anon_s:.1f}" if anonymize else "—"
+    print(
+        _row_fmt.format(
+            "TOTAL",
+            f"{len(_all_episode_stats)} episodes",
+            _total_frames,
+            _total_msgs,
+            _anon_total_cell,
+            f"{_run_elapsed:.1f}",
+            c0=_col[0], c1=_col[1], c2=_col[2], c3=_col[3], c4=_col[4], c5=_col[5],
+        )
+    )
+    print("═" * _W)
+
+    # Timing breakdown
+    def _fmt_duration(s: float) -> str:
+        if s < 60:
+            return f"{s:.1f}s"
+        m, sec = divmod(s, 60)
+        if m < 60:
+            return f"{int(m)}m {sec:.0f}s"
+        h, m2 = divmod(m, 60)
+        return f"{int(h)}h {int(m2)}m {sec:.0f}s"
+
+    _n = max(len(_all_episode_stats), 1)
+    print(f"  Wall time      : {_fmt_duration(_run_elapsed)}  ({_run_elapsed:.1f}s)")
+    if anonymize and _total_anon_s > 0:
+        _non_anon = _run_elapsed - _total_anon_s
+        print(f"  Anonymization  : {_fmt_duration(_total_anon_s)}  ({100 * _total_anon_s / _run_elapsed:.1f}% of wall time)")
+        print(f"  Non-anon work  : {_fmt_duration(_non_anon)}")
+    print(f"  Avg per episode: {_fmt_duration(_run_elapsed / _n)}")
+    print(f"  Total frames   : {_total_frames:,}  ({_total_frames / _run_elapsed:.1f} frames/s overall)")
+    if anonymize and _total_anon_s > 0:
+        print(f"  Anon throughput: {_total_frames / _total_anon_s:.1f} frames/s  ({_total_frames * len(image_write_keys) / _total_anon_s:.1f} frame-streams/s)")
+    print("═" * _W)
+
+    # Dataset layout
+    print(f"\n  Dataset root: {ds.root.resolve()}")
+    if use_videos:
+        print("    videos/<image_key>/chunk-*/file-*.mp4")
+    else:
+        print("    images/*/*.png")
+    print("    data/chunk-*/file-*.parquet")
+    print("    meta/{{info,stats}}.json  meta/tasks.parquet  meta/episodes/*/*.parquet")
+    print()
 
 
 # ---------------------------------------------------------------------------

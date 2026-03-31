@@ -33,6 +33,7 @@ import os
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -179,9 +180,19 @@ class FrameAnonymizer:
             return frames
 
         result: List[np.ndarray] = []
-        for chunk_start in range(0, len(frames), self._chunk_size):
+        n_chunks = max(1, (len(frames) + self._chunk_size - 1) // self._chunk_size)
+        for chunk_idx, chunk_start in enumerate(range(0, len(frames), self._chunk_size)):
             chunk = frames[chunk_start : chunk_start + self._chunk_size]
-            result.extend(self._send_chunk(chunk))
+            t0 = time.perf_counter()
+            anon_chunk = self._send_chunk(chunk)
+            elapsed = time.perf_counter() - t0
+            result.extend(anon_chunk)
+            print(
+                f"    [Anon] batch {chunk_idx + 1}/{n_chunks}: "
+                f"{len(chunk)} frames in {elapsed:.2f}s "
+                f"({len(chunk) / elapsed:.1f} fps)",
+                flush=True,
+            )
         return result
 
     def anonymize_episode(
@@ -205,6 +216,9 @@ class FrameAnonymizer:
         -------
         The same ``frame_dicts`` list with anonymized images written back.
         """
+        episode_t0 = time.perf_counter()
+        total_frames_processed = 0
+
         for key in image_keys:
             imgs: List[np.ndarray] = []
             valid_indices: List[int] = []
@@ -217,10 +231,26 @@ class FrameAnonymizer:
             if not imgs:
                 continue
 
+            print(f"  [Anon] stream '{key}': {len(imgs)} frames", flush=True)
+            key_t0 = time.perf_counter()
             anon_imgs = self.anonymize_batch(imgs)
+            key_elapsed = time.perf_counter() - key_t0
+            print(
+                f"  [Anon] stream '{key}' done in {key_elapsed:.2f}s "
+                f"({len(imgs) / key_elapsed:.1f} fps)",
+                flush=True,
+            )
+            total_frames_processed += len(imgs)
+
             for frame_idx, anon in zip(valid_indices, anon_imgs):
                 frame_dicts[frame_idx][key] = anon
 
+        episode_elapsed = time.perf_counter() - episode_t0
+        print(
+            f"  [Anon] episode total: {total_frames_processed} frame-streams "
+            f"across {len(image_keys)} camera(s) in {episode_elapsed:.2f}s",
+            flush=True,
+        )
         return frame_dicts
 
     def shutdown(self) -> None:
