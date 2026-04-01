@@ -90,15 +90,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import yaml
-import time
-
+import re 
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
-import os 
 from pathlib import Path
 from mcap.reader import make_reader
-import bisect
 # ---- LeRobot
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -1218,9 +1215,8 @@ def parse_args() -> argparse.Namespace:
     )
     return ap.parse_args()
 
-
 def _discover_split_folders(parent_dir: Path) -> List[Path]:
-    """Discover split folders (split0, split1, ...) in the given directory.
+    """Discover split folders (split0, split_0, ...) in the given directory.
     
     Parameters
     ----------
@@ -1237,9 +1233,9 @@ def _discover_split_folders(parent_dir: Path) -> List[Path]:
     ValueError
         If no split folders are found.
     """
-    import re
-    
-    split_pattern = re.compile(r'^split(\d+)$')
+    # El patrón r'^split_?(\d+)$' permite un guion bajo opcional (?) entre 'split' y el número
+    split_pattern = re.compile(r'^split_?(\d+)$')
+    print("split pattern", split_pattern)
     splits = []
     
     for child in parent_dir.iterdir():
@@ -1250,9 +1246,9 @@ def _discover_split_folders(parent_dir: Path) -> List[Path]:
                 splits.append((split_num, child))
     
     if not splits:
-        raise ValueError(f"No split folders (split0, split1, ...) found in {parent_dir}")
+        raise ValueError(f"No split folders (split0, split_0, ...) found in {parent_dir}")
     
-    # Sort by split number
+    # Ordenar por el número extraído (así split_2 va después de split1)
     splits.sort(key=lambda x: x[0])
     sorted_paths = [p for _, p in splits]
     
@@ -1262,11 +1258,12 @@ def _discover_split_folders(parent_dir: Path) -> List[Path]:
     
     return sorted_paths
 
-
 def main() -> None:
     """CLI entry point for batch conversion of ROS 2 bags to LeRobot."""
     args = parse_args()
     
+    print(args)
+
     if args.bag:
         # Multiple --bag arguments provided
         bag_dirs = [Path(p) for p in args.bag]
