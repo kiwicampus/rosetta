@@ -1432,10 +1432,46 @@ def _discover_split_folders(parent_dir: Path) -> List[Path]:
     return sorted_paths
 
 
+def _ensure_anon_weights() -> None:
+    """Download anonymization weight files if they are missing."""
+    import subprocess
+
+    weights_dir = Path(__file__).parent.parent.parent / "offline-anonymization" / "weights"
+    weights_dir = (
+        Path("/workspace/ros2_workspace/src/offline-anonymization/weights")
+        if not weights_dir.exists()
+        else weights_dir
+    )
+    face_pb = weights_dir / "weights_face_v1.0.0.pb"
+    plate_pb = weights_dir / "weights_plate_v1.0.0.pb"
+
+    if face_pb.exists() and plate_pb.exists():
+        return
+
+    print("[Anonymizer] Weight files not found – downloading from GCS …")
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "gsutil", "-m", "cp",
+        "gs://autonomy-vision/models/anonymization/weights_face_v1.0.0.pb",
+        "gs://autonomy-vision/models/anonymization/weights_plate_v1.0.0.pb",
+        str(weights_dir) + "/",
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Failed to download anonymization weights. "
+            "Make sure gsutil is installed and you are authenticated."
+        )
+    print("[Anonymizer] Weights downloaded successfully.")
+
+
 def main() -> None:
     """CLI entry point for batch conversion of ROS 2 bags to LeRobot."""
     args = parse_args()
-    
+
+    if args.anonymize:
+        _ensure_anon_weights()
+
     if args.bag:
         # Multiple --bag arguments provided
         bag_dirs = [Path(p) for p in args.bag]
