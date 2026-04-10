@@ -567,6 +567,8 @@ def export_bags_to_lerobot(
     data_mb: int = 100,
     video_mb: int = 500,
     timestamp_source: str = "contract",  # 'contract' | 'receive' | 'header' |
+    anonymize: bool = False,
+    anonymize_gpu: bool = True,
 ) -> None:
 
     """Convert bag directories into a LeRobot v3 dataset under `out_root`.
@@ -600,6 +602,14 @@ def export_bags_to_lerobot(
         - "contract": Use bag time, unless spec.stamp_src == "header" or spec.stamp_src == "foxglove"
         - "receive":  Always use bag receive time.
         - "header":   Prefer header stamp; fall back to bag receive time.
+    anonymize : bool, default False
+        If True, anonymize faces and license plates in all image frames
+        before writing them to the dataset.  Uses the offline-anonymization
+        submodule via a persistent TF1.15 daemon (loaded once, shared across
+        all episodes).
+    anonymize_gpu : bool, default True
+        When ``anonymize=True``, whether to run inference on GPU.  Pass
+        ``False`` on CPU-only machines.
 
     Raises
     ------
@@ -762,9 +772,30 @@ def export_bags_to_lerobot(
     ]
     shapes = {k: tuple(features[k]["shape"]) for k in write_keys}
 
+    # Image keys used for anonymization (pre-computed once per run).
+    image_write_keys = [
+        k for k, ft in features.items() if ft["dtype"] in ("video", "image")
+    ]
+
+    # Initialise the anonymizer daemon ONCE here so the model is loaded
+    # a single time and reused across all episodes.
+    _anonymizer = None
+    if anonymize:
+        from rosetta.common.anonymizer import FrameAnonymizer
+        _anonymizer = FrameAnonymizer.get_instance(gpu=anonymize_gpu)
+        print(
+            f"[Anonymizer] Initialized. Will anonymize {len(image_write_keys)} "
+            f"image stream(s) per episode: {image_write_keys}",
+            flush=True,
+        )
+
     # Episodes
+    import time as _time
     total_episodes = len(bag_dirs)
+    _run_t0 = _time.perf_counter()
+    _all_episode_stats: List[Dict] = []
     for epi_idx, bag_dir in enumerate(bag_dirs):
+        _episode_t0 = _time.perf_counter()
         print(f"Processing episode {epi_idx + 1} of {total_episodes}")
         print(f"[Episode {epi_idx}] {bag_dir}")
 
@@ -994,6 +1025,12 @@ def export_bags_to_lerobot(
         # Write frames
         print(f"Processing {n_ticks} frames...")
 
+        # When anonymizing: buffer all assembled frames, then batch-anonymize
+        # image fields in one shot before calling add_frame.  This keeps the
+        # tick loop unchanged and maximises GPU throughput (one inference pass
+        # per episode instead of one per frame).
+        _episode_frame_buffer: Optional[List[Dict]] = [] if anonymize else None
+
         for i in range(n_ticks):
             # Print progress every 10% or every 100 frames, whichever is more frequent
             if i == 0 or (i + 1) % max(1, min(100, n_ticks // 10)) == 0 or (i + 1) == n_ticks:
@@ -1149,8 +1186,31 @@ def export_bags_to_lerobot(
             # Debug: log first frame values to verify they're being set correctly
             if i == 0:
                 print(f"[Frame 0] Setting observation.state.* values: road_type='{frame['observation.state.road_type']}', surface='{frame['observation.state.surface']}', weather='{frame['observation.state.weather']}', time_of_day='{frame['observation.state.time_of_day']}'")
-            
-            ds.add_frame(frame)
+
+            if _episode_frame_buffer is not None:
+                _episode_frame_buffer.append(frame)
+            else:
+                ds.add_frame(frame)
+
+        # ---------------------------------------------------------------
+        # Anonymize episode frames (batch mode) and flush to dataset
+        # ---------------------------------------------------------------
+        _anon_elapsed = 0.0
+        if _episode_frame_buffer is not None and _anonymizer is not None:
+            print(
+                f"  [Anonymizer] Anonymizing {len(_episode_frame_buffer)} frames "
+                f"across {len(image_write_keys)} camera stream(s) …",
+                flush=True,
+            )
+            _anon_t0 = _time.perf_counter()
+            _anonymizer.anonymize_episode(_episode_frame_buffer, image_write_keys)
+            _anon_elapsed = _time.perf_counter() - _anon_t0
+            print(
+                f"  [Anonymizer] Done in {_anon_elapsed:.1f}s. Writing frames to dataset …",
+                flush=True,
+            )
+            for _frame in _episode_frame_buffer:
+                ds.add_frame(_frame)
 
         ds.save_episode()
         print(
@@ -1169,18 +1229,111 @@ def export_bags_to_lerobot(
                 
         # Clear cache for this episode to free memory
         _clear_cache_for_bag(bag_dir)
-        
+
         _close_mcap_readers_for_bag(bag_dir)
-    
-    print(f"\n[OK] Dataset root: {ds.root.resolve()}")
-    if use_videos:
-        print("  - videos/<image_key>/chunk-*/file-*.mp4")
-    else:
-        print("  - images/*/*.png")
-    print("  - data/chunk-*/file-*.parquet")
+
+        _episode_elapsed = _time.perf_counter() - _episode_t0
+        print(
+            f"  [Timing] Episode {epi_idx + 1}/{total_episodes} done in "
+            f"{_episode_elapsed:.1f}s ({_episode_elapsed / 60:.1f} min)"
+        )
+        _all_episode_stats.append(
+            {
+                "idx": epi_idx + 1,
+                "bag": bag_dir.name,
+                "frames": n_ticks,
+                "decoded_msgs": decoded_msgs,
+                "anon_s": _anon_elapsed,
+                "total_s": _episode_elapsed,
+            }
+        )
+
+    _run_elapsed = _time.perf_counter() - _run_t0
+
+    # -------------------------------------------------------------------
+    # Final summary
+    # -------------------------------------------------------------------
+    _W = 80
+    print("\n" + "═" * _W)
+    print("  CONVERSION SUMMARY")
+    print("═" * _W)
+
+    # Per-episode table
+    _col = [6, 28, 8, 12, 10, 10]
+    _hdr = ["Ep", "Bag", "Frames", "Msgs", "Anon (s)", "Total (s)"]
+    _row_fmt = "  {:<{c0}}  {:<{c1}}  {:>{c2}}  {:>{c3}}  {:>{c4}}  {:>{c5}}"
     print(
-        "  - meta/info.json, meta/tasks.parquet, meta/stats.json, meta/episodes/*/*.parquet"
+        _row_fmt.format(*_hdr, c0=_col[0], c1=_col[1], c2=_col[2], c3=_col[3], c4=_col[4], c5=_col[5])
     )
+    print("  " + "-" * (_W - 2))
+    _total_frames = 0
+    _total_msgs = 0
+    _total_anon_s = 0.0
+    for _s in _all_episode_stats:
+        _anon_cell = f"{_s['anon_s']:.1f}" if _s["anon_s"] > 0 else "—"
+        print(
+            _row_fmt.format(
+                _s["idx"],
+                _s["bag"][:_col[1]],
+                _s["frames"],
+                _s["decoded_msgs"],
+                _anon_cell,
+                f"{_s['total_s']:.1f}",
+                c0=_col[0], c1=_col[1], c2=_col[2], c3=_col[3], c4=_col[4], c5=_col[5],
+            )
+        )
+        _total_frames += _s["frames"]
+        _total_msgs += _s["decoded_msgs"]
+        _total_anon_s += _s["anon_s"]
+
+    print("  " + "─" * (_W - 2))
+
+    # Totals row
+    _anon_total_cell = f"{_total_anon_s:.1f}" if anonymize else "—"
+    print(
+        _row_fmt.format(
+            "TOTAL",
+            f"{len(_all_episode_stats)} episodes",
+            _total_frames,
+            _total_msgs,
+            _anon_total_cell,
+            f"{_run_elapsed:.1f}",
+            c0=_col[0], c1=_col[1], c2=_col[2], c3=_col[3], c4=_col[4], c5=_col[5],
+        )
+    )
+    print("═" * _W)
+
+    # Timing breakdown
+    def _fmt_duration(s: float) -> str:
+        if s < 60:
+            return f"{s:.1f}s"
+        m, sec = divmod(s, 60)
+        if m < 60:
+            return f"{int(m)}m {sec:.0f}s"
+        h, m2 = divmod(m, 60)
+        return f"{int(h)}h {int(m2)}m {sec:.0f}s"
+
+    _n = max(len(_all_episode_stats), 1)
+    print(f"  Wall time      : {_fmt_duration(_run_elapsed)}  ({_run_elapsed:.1f}s)")
+    if anonymize and _total_anon_s > 0:
+        _non_anon = _run_elapsed - _total_anon_s
+        print(f"  Anonymization  : {_fmt_duration(_total_anon_s)}  ({100 * _total_anon_s / _run_elapsed:.1f}% of wall time)")
+        print(f"  Non-anon work  : {_fmt_duration(_non_anon)}")
+    print(f"  Avg per episode: {_fmt_duration(_run_elapsed / _n)}")
+    print(f"  Total frames   : {_total_frames:,}  ({_total_frames / _run_elapsed:.1f} frames/s overall)")
+    if anonymize and _total_anon_s > 0:
+        print(f"  Anon throughput: {_total_frames / _total_anon_s:.1f} frames/s  ({_total_frames * len(image_write_keys) / _total_anon_s:.1f} frame-streams/s)")
+    print("═" * _W)
+
+    # Dataset layout
+    print(f"\n  Dataset root: {ds.root.resolve()}")
+    if use_videos:
+        print("    videos/<image_key>/chunk-*/file-*.mp4")
+    else:
+        print("    images/*/*.png")
+    print("    data/chunk-*/file-*.parquet")
+    print("    meta/{{info,stats}}.json  meta/tasks.parquet  meta/episodes/*/*.parquet")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -1212,6 +1365,22 @@ def parse_args() -> argparse.Namespace:
             "Which time base to use when resampling: "
             "'contract' (per-spec), 'bag' (receive), or 'header' (message header)."
         ),
+    )
+    ap.add_argument(
+        "--anonymize",
+        action="store_true",
+        default=False,
+        help=(
+            "Anonymize faces and license plates in all image frames before "
+            "saving to the dataset.  Requires the offline-anonymization submodule "
+            "and the anon_env conda environment (see README for setup)."
+        ),
+    )
+    ap.add_argument(
+        "--no-anonymize-gpu",
+        action="store_true",
+        default=False,
+        help="Disable GPU for anonymization (forces CPU inference). Default: GPU enabled.",
     )
     return ap.parse_args()
 
@@ -1258,11 +1427,46 @@ def _discover_split_folders(parent_dir: Path) -> List[Path]:
     
     return sorted_paths
 
+
+def _ensure_anon_weights() -> None:
+    """Download anonymization weight files if they are missing."""
+    import subprocess
+
+    weights_dir = Path(__file__).parent.parent.parent / "offline-anonymization" / "weights"
+    weights_dir = (
+        Path("/workspace/ros2_workspace/src/offline-anonymization/weights")
+        if not weights_dir.exists()
+        else weights_dir
+    )
+    face_pb = weights_dir / "weights_face_v1.0.0.pb"
+    plate_pb = weights_dir / "weights_plate_v1.0.0.pb"
+
+    if face_pb.exists() and plate_pb.exists():
+        return
+
+    print("[Anonymizer] Weight files not found – downloading from GCS …")
+    weights_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "gsutil", "-m", "cp",
+        "gs://autonomy-vision/models/anonymization/weights_face_v1.0.0.pb",
+        "gs://autonomy-vision/models/anonymization/weights_plate_v1.0.0.pb",
+        str(weights_dir) + "/",
+    ]
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Failed to download anonymization weights. "
+            "Make sure gsutil is installed and you are authenticated."
+        )
+    print("[Anonymizer] Weights downloaded successfully.")
+
+
 def main() -> None:
     """CLI entry point for batch conversion of ROS 2 bags to LeRobot."""
     args = parse_args()
-    
-    print(args)
+
+    if args.anonymize:
+        _ensure_anon_weights()
 
     if args.bag:
         # Multiple --bag arguments provided
@@ -1307,7 +1511,14 @@ def main() -> None:
         data_mb=args.data_mb,
         video_mb=args.video_mb,
         timestamp_source=args.timestamp,
+        anonymize=args.anonymize,
+        anonymize_gpu=not args.no_anonymize_gpu,
     )
+
+    if args.anonymize:
+        # Cleanly shut down the daemon (sends poison pill, waits for exit).
+        from rosetta.common.anonymizer import FrameAnonymizer
+        FrameAnonymizer.get_instance().shutdown()
 
 
 if __name__ == "__main__":

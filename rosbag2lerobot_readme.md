@@ -80,3 +80,81 @@ Tasks are defined in the metadata.yaml of each mcap at the end:
 ```
 
 If not defined, the task is set as "" 
+
+---
+
+## Face & License-Plate Anonymization
+
+`bag_to_lerobot.py` can automatically blur faces and license plates in every
+image frame before they are written to the dataset.  The feature uses the
+[offline-anonymization](https://github.com/kiwicampus/offline-anonymization)
+submodule and a dedicated **TF 1.15 + CUDA 10.0** conda environment
+(`anon_env`) that lives inside the Docker image.  The model is loaded
+**once** at startup and reused across all episodes (GPU-accelerated,
+batch-processed per episode).
+
+### One-time setup
+
+**1. Initialise the submodule** (if you cloned without `--recurse-submodules`):
+
+```bash
+git submodule update --init ros2_workspace/src/offline-anonymization
+```
+
+**2. Rebuild the Docker image**
+
+The Dockerfile installs Miniconda and the `anon_env` automatically.
+
+```bash
+# Default — GPU (CUDA 10.0 managed by conda, compatible with CUDA 12 driver)
+docker compose -f .devcontainer/docker-compose.yml build
+
+# CPU-only machines (no NVIDIA GPU)
+ANON_GPU=false docker compose -f .devcontainer/docker-compose.yml build
+```
+
+> **CUDA compatibility note**: the container's NVIDIA driver (≥525, required
+> for CUDA 12.4) is fully backward-compatible with the CUDA 10.0 runtime that
+> conda installs for TF 1.15.  No conflict with the system CUDA 12 libraries.
+
+**3. Model weights** are downloaded automatically on first run to
+`ros2_workspace/src/offline-anonymization/weights/`.
+
+---
+
+### Running with anonymization
+
+```bash
+python ros2_workspace/src/rosetta/scripts/bag_to_lerobot.py \
+    --bags /path/to/session_folder \
+    --contract /path/to/contract.yaml \
+    --out /path/to/output \
+    --anonymize
+```
+
+Force CPU inference (slower, no GPU required):
+
+```bash
+python bag_to_lerobot.py \
+    --bags /path/to/session_folder \
+    --contract /path/to/contract.yaml \
+    --anonymize \
+    --no-anonymize-gpu
+```
+
+**What happens internally:**
+
+1. A persistent `anonymize_daemon.py` subprocess is spawned inside `anon_env`.
+2. The face + plate TF 1.15 models are loaded **once**.
+3. For each episode: all image frames are collected into a buffer, sent to the
+   daemon as a single batch, and the anonymized frames are written back before
+   `add_frame` is called.
+4. The daemon is shut down cleanly when all episodes are processed.
+
+**Tunable env vars** (advanced):
+
+| Variable | Default | Description |
+|---|---|---|
+| `ANON_WEIGHTS_DIR` | `offline-anonymization/weights/` | Path to pre-downloaded weights |
+| `ANON_FACE_THRESHOLD` | `0.3` | Detection confidence threshold for faces |
+| `ANON_PLATE_THRESHOLD` | `0.3` | Detection confidence threshold for plates |
