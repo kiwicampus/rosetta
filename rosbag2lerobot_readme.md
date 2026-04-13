@@ -131,7 +131,15 @@ python ros2_workspace/src/rosetta/scripts/bag_to_lerobot.py \
     --out /path/to/output \
     --anonymize
 ```
-
+(if first run does not work, delete the models and manually install them: 
+`rm -rf /workspace/ros2_workspace/src/offline-anonymization/weights/`
+```bash 
+    mkdir -p /workspace/ros2_workspace/src/offline-anonymization/weights && gsutil -m cp \
+  "gs://autonomy-vision/models/anonymization/weights_face_v1.0.0.pb" \
+  "gs://autonomy-vision/models/anonymization/weights_plate_v1.0.0.pb" \
+  /workspace/ros2_workspace/src/offline-anonymization/weights/
+  ```
+)
 Force CPU inference (slower, no GPU required):
 
 ```bash
