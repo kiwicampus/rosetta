@@ -632,6 +632,9 @@ def export_bags_to_lerobot(
     step_ns = int(round(1e9 / fps))
     specs = list(iter_specs(contract))
 
+    # Map action key → lookahead_n for any action that stacks future steps
+    action_lookahead = {a.key: a.lookahead_n for a in contract.actions if a.lookahead_n > 0}
+
     # Validate that all image specs have resize defined
     image_specs_without_resize = [
         sv for sv in specs 
@@ -702,24 +705,37 @@ def export_bags_to_lerobot(
     
     # Consolidate multiple action specs with the same key into a single feature
     for action_key, action_specs in action_specs_by_key.items():
+        la_n = action_lookahead.get(action_key, 0)
         if len(action_specs) > 1:
-            # Multiple specs with same key - consolidate them
-            all_names = []
-            total_shape = 0
+            single_names = []
+            single_shape = 0
             for sv in action_specs:
-                all_names.extend(sv.names)
-                total_shape += len(sv.names)
-            
+                single_names.extend(sv.names)
+                single_shape += len(sv.names)
+        else:
+            sv = action_specs[0]
+            _, ft, _ = feature_from_spec(sv, use_videos)
+            single_shape = ft["shape"][0]
+            single_names = list(sv.names)
+
+        if la_n > 0:
+            step_names = [f"t{s}_{n}" for s in range(1, la_n + 1) for n in single_names]
             features[action_key] = {
                 "dtype": "float32",
-                "shape": (total_shape,),
-                "names": all_names
+                "shape": (single_shape * la_n,),
+                "names": step_names,
             }
         else:
-            # Single spec - use it as-is
-            sv = action_specs[0]
-            k, ft, _ = feature_from_spec(sv, use_videos)
-            features[k] = ft
+            if len(action_specs) > 1:
+                features[action_key] = {
+                    "dtype": "float32",
+                    "shape": (single_shape,),
+                    "names": single_names,
+                }
+            else:
+                sv = action_specs[0]
+                k, ft, _ = feature_from_spec(sv, use_videos)
+                features[k] = ft
             
     # Mark depth videos in features metadata before dataset creation
     for key, feature in features.items():
@@ -1068,21 +1084,29 @@ def export_bags_to_lerobot(
                 if action_key not in features:
                     continue
 
-                action_values = []
-                for sv in action_specs:
-                    unique_key = f"{sv.key}_{sv.topic.replace('/', '_')}"
-                    stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
-                    if stream_val is not None:
-                        val_array = np.asarray(stream_val, dtype=np.float32).reshape(-1)
-                        action_values.append(val_array)
+                la_n = action_lookahead.get(action_key, 0)
+                single_size = features[action_key]["shape"][0] // max(la_n, 1)
 
-                if action_values:
-                    concatenated_action = np.concatenate(action_values)
-                    frame[action_key] = concatenated_action
+                def _read_tick(tick_idx: int) -> Optional[np.ndarray]:
+                    vals = []
+                    for sv in action_specs:
+                        unique_key = f"{sv.key}_{sv.topic.replace('/', '_')}"
+                        stream_val = resampled.get(unique_key, [None] * n_ticks)[tick_idx]
+                        if stream_val is not None:
+                            vals.append(np.asarray(stream_val, dtype=np.float32).reshape(-1))
+                    return np.concatenate(vals) if vals else None
+
+                if la_n == 0:
+                    val = _read_tick(i)
+                    frame[action_key] = val if val is not None else zero_pad_map[action_key]
                 else:
-                    frame[action_key] = zero_pad_map[action_key]
+                    steps = []
+                    for step in range(1, la_n + 1):
+                        j = min(i + step, n_ticks - 1)
+                        val = _read_tick(j)
+                        steps.append(val if val is not None else np.zeros(single_size, dtype=np.float32))
+                    frame[action_key] = np.concatenate(steps)
 
-                        
             # Process all other features
             for name in write_keys:
                 # Skip observation.state as it's handled above
@@ -1090,7 +1114,7 @@ def export_bags_to_lerobot(
                     continue
                 
                 # Skip consolidated actions as they're handled above
-                if name in action_specs_by_key: 
+                if name in action_specs_by_key:
                     continue
                 
                 # Skip observation.state.* metadata fields as they're handled below

@@ -67,17 +67,19 @@ class ActionSpec:
             strategy: { mode: nearest, tolerance_ms: 500 }
           selector: { names: [linear.x, angular.z] }
           from_tensor: { clamp: [-2.0, 2.0] }
+          lookahead_n: 10   # stack N future steps; works for any action type
           safety_behavior: hold
     """
 
     key: str
-    publish_topic: str
-    type: str
+    publish_topic: str = ""
+    type: str = ""
     selector: Optional[Dict[str, Any]] = None
     from_tensor: Optional[Dict[str, Any]] = None
     publish_qos: Optional[Dict[str, Any]] = None
     publish_strategy: Optional[Dict[str, Any]] = None
     safety_behavior: str = "zeros"  # "zeros" | "hold"
+    lookahead_n: int = 0      # >0: stack N future steps as action (training only)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +139,7 @@ def load_contract(path: Path | str) -> Contract:
         sb = str(it.get("safety_behavior", "zeros")).lower().strip()
         if sb not in ("zeros", "hold"):
             sb = "zeros"
+        lookahead_n = int(it.get("lookahead_n", 0))
         return ActionSpec(
             key=it["key"],
             publish_topic=pub["topic"],
@@ -146,6 +149,7 @@ def load_contract(path: Path | str) -> Contract:
             publish_qos=pub.get("qos"),
             publish_strategy=pub.get("strategy"),
             safety_behavior=sb,
+            lookahead_n=lookahead_n,
         )
 
     def _task(it: Dict[str, Any]) -> TaskSpec:

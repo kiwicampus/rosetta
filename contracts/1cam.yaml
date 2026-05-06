@@ -36,9 +36,8 @@ observations:
     type: sensor_msgs/msg/NavSatFix
     selector:
       names: [longitude, latitude]
-    align: {strategy: closest, stamp: header, tol_ms: 150}
+    align: {strategy: closest, stamp: header, tol_ms: 10}
     qos: {reliability: best_effort, history: keep_last, depth: 50}
-
 
 actions:
   - key: action
@@ -55,7 +54,23 @@ actions:
       #names: [twist.linear.x, twist.linear.y, twist.linear.z, twist.angular.x, twist.angular.y, twist.angular.z] 
     from_tensor:
       clamp: [-2.0, 2.0]
+    #lookahead_n: 5 
     safety_behavior: zeros
+    
+# actions:
+#   - key: action
+#     publish:
+#       topic: /gps/filtered
+#       type: sensor_msgs/msg/NavSatFix
+#       layout: flat
+#       qos: {reliability: best_effort, history: keep_last, depth: 10}
+#       strategy:
+#         mode: nearest
+#         tolerance_ms: 500
+#     selector:
+#       names: [latitude, longitude]
+#     lookahead_n: 5        # stack N future steps; change to 10 for 10-waypoint horizon
+#     safety_behavior: zeros
 
 recording:
   storage: mcap
