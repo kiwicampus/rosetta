@@ -7,7 +7,9 @@ PolicyBridge: contract-true live policy inference.
 
 from __future__ import annotations
 
+import csv
 import json
+import math
 import os
 import threading
 from collections import deque
@@ -23,7 +25,11 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from nav_msgs.msg import Odometry, Path
+from sensor_msgs.msg import NavSatFix
+from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout
 from std_srvs.srv import Trigger
 from rosidl_runtime_py.utilities import get_message
 from rcl_interfaces.msg import SetParametersResult
@@ -41,6 +47,7 @@ from rosetta.common.contract_utils import (
     qos_profile_from_dict,    contract_fingerprint,
     decode_value,
     StreamBuffer,
+    observation_stored_footprint,
     stamp_from_header_ns,
     encode_value,
 )
@@ -118,8 +125,25 @@ class PolicyBridge(Node):
         self.declare_parameter("max_queue_actions", 512)
         self.declare_parameter("use_header_time", True)
         self.declare_parameter("use_autocast", False)
+        self.declare_parameter("bridge_debug", False)
+        # std_msgs/Float32MultiArray when use_chunks is false; empty string disables.
+        self.declare_parameter("predicted_action_topic", "predicted_action")
+        self.declare_parameter("debug_chunk_topic", "debug/predicted_chunk")
+        self.declare_parameter("debug_exec_topic", "debug/executed_action")
+        self.declare_parameter("debug_chunk_log_dir", "")
+        # Log latest reference command next to executed actions in executed.csv (TwistStamped).
+        self.declare_parameter(
+            "reference_cmd_topic",
+            "/motion_control/speed_controller/reference_cmd",
+        )
+        # Odometry pose sampled when each chunk is generated (for executed.csv anchors).
+        self.declare_parameter("chunk_log_anchor_odom_topic", "/odometry/local")
 
         self._params = self._read_params()
+        self._bridge_debug = bool(self.get_parameter("bridge_debug").value)
+        self._debug_chunk_log_dir = str(
+            self.get_parameter("debug_chunk_log_dir").value or ""
+        ).strip()
         self.add_on_set_parameters_callback(self._on_params)
 
         # ---------------- Contract ----------------
@@ -127,6 +151,8 @@ class PolicyBridge(Node):
         if not contract_path:
             raise RuntimeError("policy_bridge: 'contract_path' is required")
         self._contract = load_contract(Path(contract_path))
+
+        print(f"Loaded contract from {contract_path} with {len(self._contract.observations or [])} observations and {len(self._contract.actions or [])} actions.")
 
         self._obs_qos_by_key: Dict[str, Optional[Dict[str, Any]]] = {
             o.key: o.qos for o in (self._contract.observations or [])
@@ -142,7 +168,8 @@ class PolicyBridge(Node):
 
         # Check if policy_path is a Hugging Face repo ID (contains '/')
         is_hf_repo = '/' in policy_path and not os.path.exists(policy_path)
-    
+
+        print("Using policy path:", policy_path)
         cfg_type = ""  # Default value
         if is_hf_repo:
             # For Hugging Face repos, we'll let from_pretrained handle the download
@@ -310,6 +337,50 @@ class PolicyBridge(Node):
         self.get_logger().info(
             f"Subscribed to {len(self._subs)} observation streams.")
 
+        # Latest reference command (ground truth) for CSV logging — same layout as primary action spec names.
+        self._ref_lock = threading.Lock()
+        self._ref_vec: Optional[np.ndarray] = None
+        ref_topic = str(self.get_parameter("reference_cmd_topic").value or "").strip()
+        self._reference_cmd_topic = ref_topic if ref_topic else ""
+        if self._reference_cmd_topic:
+            ref_qos = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                TwistStamped,
+                self._reference_cmd_topic,
+                self._reference_cmd_cb,
+                ref_qos,
+                callback_group=self._cbg,
+            )
+            self.get_logger().info(
+                f"Subscribed to reference cmd for CSV: {self._reference_cmd_topic}"
+            )
+
+        self._odom_lock = threading.Lock()
+        self._last_odom_xyyaw: Optional[Tuple[float, float, float]] = None
+        anchor_topic = str(
+            self.get_parameter("chunk_log_anchor_odom_topic").value or ""
+        ).strip()
+        if self._debug_chunk_log_dir and anchor_topic:
+            odom_qos = QoSProfile(
+                depth=10,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                history=HistoryPolicy.KEEP_LAST,
+            )
+            self.create_subscription(
+                Odometry,
+                anchor_topic,
+                self._anchor_odom_cb,
+                odom_qos,
+                callback_group=self._cbg,
+            )
+            self.get_logger().info(
+                f"Subscribed to odometry for chunk CSV anchors: {anchor_topic}"
+            )
+
         # ---------------- Publishers ----------------
         self._act_pubs: Dict[str, Any] = {}
         for spec in self._action_specs:
@@ -323,6 +394,48 @@ class PolicyBridge(Node):
         
         # For backward compatibility, keep the primary publisher reference
         self._act_pub = self._act_pubs[self._act_spec.topic]
+
+        pred_topic = str(
+            self.get_parameter("predicted_action_topic").value or ""
+        ).strip()
+        self._predicted_action_pub: Optional[Any] = None
+        if pred_topic:
+            self._predicted_action_pub = self.create_publisher(
+                Float32MultiArray,
+                pred_topic,
+                QoSProfile(depth=10),
+            )
+            self.get_logger().info(
+                f"Predicted action debug publisher (use_chunks=false): '{pred_topic}' "
+                "(std_msgs/Float32MultiArray)"
+            )
+
+        dbg_chunk_topic = str(
+            self.get_parameter("debug_chunk_topic").value or ""
+        ).strip()
+        dbg_exec_topic = str(
+            self.get_parameter("debug_exec_topic").value or ""
+        ).strip()
+        self._debug_chunk_pub: Optional[Any] = None
+        self._debug_exec_pub: Optional[Any] = None
+        if dbg_chunk_topic:
+            self._debug_chunk_pub = self.create_publisher(
+                Float32MultiArray,
+                dbg_chunk_topic,
+                QoSProfile(depth=10),
+            )
+            self.get_logger().info(
+                f"Debug predicted-chunk publisher: '{dbg_chunk_topic}'"
+            )
+        if dbg_exec_topic:
+            self._debug_exec_pub = self.create_publisher(
+                Float32MultiArray,
+                dbg_exec_topic,
+                QoSProfile(depth=10),
+            )
+            self.get_logger().info(
+                f"Debug executed-action publisher: '{dbg_exec_topic}'"
+            )
 
         self._cancel_srv = self.create_service(
             Trigger, f"{_ACTION_NAME}/cancel", self._cancel_service_cb,
@@ -379,12 +492,17 @@ class PolicyBridge(Node):
         self._publish_tolerance_ns = int(self.step_ns)
 
         # ---------------- Async producer/executor ----------------
-        self._queue: Deque[Tuple[int, np.ndarray]] = deque(
+        # Queue entries: (sched_time_ns, action_vec, chunk_id, step_index)
+        self._queue: Deque[Tuple[int, np.ndarray, int, int]] = deque(
             maxlen=self._params.max_queue_actions
         )
         self._queue_lock = threading.Lock()
         self._last_action: Optional[np.ndarray] = None
-        self._producer_buffer: List[Tuple[int, np.ndarray]] = []
+        self._producer_buffer: List[Tuple[int, np.ndarray, int, int]] = []
+        self._chunk_counter: int = 0
+        self._chunk_anchors: Dict[int, Tuple[float, float, float]] = {}
+        self._run_start_ns: Optional[int] = None
+        self._exec_csv_header_written: bool = False
 
         self._cbg_timers = ReentrantCallbackGroup()
         self._producer_timer = self.create_timer(
@@ -403,6 +521,11 @@ class PolicyBridge(Node):
         self.get_logger().info(
             f"PolicyBridge ready at {self.fps:.1f} Hz on device={self.device}."
         )
+        if self._bridge_debug:
+            self.get_logger().info(
+                "[bridge_debug] enabled: extra logs for observation zero-padding causes "
+                "(set bridge_debug:=false to silence)"
+            )
 
     # ---------------- Parameter handling ----------------
     def _read_params(self) -> _RuntimeParams:
@@ -418,6 +541,9 @@ class PolicyBridge(Node):
         )
 
     def _on_params(self, _params: List[Parameter]) -> SetParametersResult:
+        for p in _params:
+            if p.name == "bridge_debug":
+                self._bridge_debug = bool(p.value)
         new_params = self._read_params()
         if self._queue.maxlen != new_params.max_queue_actions:
             with self._queue_lock:
@@ -427,6 +553,141 @@ class PolicyBridge(Node):
 
     def _next_exec_tick_ns(self, now_ns: int) -> int:
         return ((now_ns + self.step_ns - 1) // self.step_ns) * self.step_ns
+
+    @staticmethod
+    def _float32_multiarray_1d(
+        vec: np.ndarray, dim_label: str = "action_dim"
+    ) -> Float32MultiArray:
+        v = np.asarray(vec, dtype=np.float32).ravel()
+        n = int(v.size)
+        msg = Float32MultiArray()
+        msg.layout.dim = [
+            MultiArrayDimension(label=dim_label, size=n, stride=n)
+        ]
+        msg.layout.data_offset = 0
+        msg.data = v.tolist()
+        return msg
+
+    def _run_log_dir(self) -> Optional[Path]:
+        if not self._debug_chunk_log_dir or self._run_start_ns is None:
+            return None
+        p = Path(self._debug_chunk_log_dir) / str(self._run_start_ns)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _anchor_odom_cb(self, msg: Odometry) -> None:
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+        with self._odom_lock:
+            self._last_odom_xyyaw = (float(p.x), float(p.y), float(yaw))
+
+    def _snapshot_chunk_anchor_odom(self) -> Tuple[float, float, float]:
+        with self._odom_lock:
+            if self._last_odom_xyyaw is None:
+                return (float("nan"), float("nan"), float("nan"))
+            return self._last_odom_xyyaw
+
+    def _reference_row_for_csv(self, n_d: int) -> list[float]:
+        """Align decoded reference (TwistStamped via primary spec names) to n_d columns; pad with nan."""
+        if not self._reference_cmd_topic or n_d <= 0:
+            return []
+        with self._ref_lock:
+            if self._ref_vec is None:
+                return [float("nan")] * n_d
+            r = np.asarray(self._ref_vec, dtype=np.float64).ravel()
+        row = [float("nan")] * n_d
+        m = min(n_d, int(r.size))
+        for i in range(m):
+            row[i] = float(r[i])
+        return row
+
+    def _append_executed_csv(
+        self,
+        chunk_id: int,
+        step_index: int,
+        exec_time_ns: int,
+        action_vec: np.ndarray,
+    ) -> None:
+        d = self._run_log_dir()
+        if d is None:
+            return
+        path = d / "executed.csv"
+        vec = np.asarray(action_vec, dtype=np.float32).ravel()
+        n_d = int(vec.size)
+        ref_suffix = self._reference_row_for_csv(n_d)
+        write_header = (not path.exists()) or (not self._exec_csv_header_written)
+        with path.open("a", newline="") as f:
+            w = csv.writer(f)
+            if write_header:
+                cols = (
+                    ["chunk_id", "step_index", "exec_time_ns"]
+                    + ["anchor_x", "anchor_y", "anchor_yaw"]
+                    + [f"d{i}" for i in range(n_d)]
+                )
+                if ref_suffix:
+                    cols += [f"ref_d{i}" for i in range(n_d)]
+                w.writerow(cols)
+                self._exec_csv_header_written = True
+            anchor = self._chunk_anchors.get(
+                chunk_id, (float("nan"), float("nan"), float("nan"))
+            )
+            row = (
+                [chunk_id, step_index, exec_time_ns]
+                + [anchor[0], anchor[1], anchor[2]]
+                + vec.tolist()
+            )
+            if ref_suffix:
+                row += ref_suffix
+            w.writerow(row)
+
+    def _publish_debug_predicted_chunk(self, chunk_id: int, arr: np.ndarray) -> None:
+        if self._debug_chunk_pub is None:
+            return
+        a = np.asarray(arr, dtype=np.float32)
+        if a.ndim == 1:
+            a = a.reshape(1, -1)
+        horizon, dim = int(a.shape[0]), int(a.shape[1])
+        flat = a.reshape(-1)
+        n = int(flat.size)
+        msg = Float32MultiArray()
+        msg.layout.dim = [
+            MultiArrayDimension(
+                label=f"chunk_id:{chunk_id} horizon:{horizon} dim:{dim}",
+                size=n,
+                stride=n,
+            )
+        ]
+        msg.layout.data_offset = 0
+        msg.data = flat.tolist()
+        self._debug_chunk_pub.publish(msg)
+
+    def _save_predicted_chunk_npy(self, chunk_id: int, arr: np.ndarray) -> None:
+        d = self._run_log_dir()
+        if d is None:
+            return
+        a = np.asarray(arr, dtype=np.float32)
+        if a.ndim == 1:
+            a = a.reshape(1, -1)
+        np.save(d / f"chunk_{chunk_id:06d}.npy", a)
+
+    def _publish_executed_debug(
+        self,
+        action_vec: np.ndarray,
+        chunk_id: int,
+        step_index: int,
+    ) -> None:
+        exec_ns = self.get_clock().now().nanoseconds
+        if self._debug_exec_pub is not None:
+            self._debug_exec_pub.publish(
+                self._float32_multiarray_1d(
+                    action_vec,
+                    dim_label=f"chunk_id:{chunk_id} step:{step_index}",
+                )
+            )
+        self._append_executed_csv(chunk_id, step_index, exec_ns, action_vec)
 
     # ---------------- Timers (persistent) ----------------
     def _feedback_tick(self) -> None:
@@ -507,6 +768,12 @@ class PolicyBridge(Node):
         self._finishing.clear()
         self._running_event.set()
         self._pub_count = 0
+        self._run_start_ns = self.get_clock().now().nanoseconds
+        self._exec_csv_header_written = False
+        self._chunk_counter = 0
+        self._chunk_anchors.clear()
+        with self._ref_lock:
+            self._ref_vec = None
         with self._queue_lock:
             self._queue.clear()
 
@@ -597,8 +864,15 @@ class PolicyBridge(Node):
                 total_size = 2  # fallback minimum
             return np.zeros((total_size,), dtype=np.float32)
 
-    def _publish_action_vector(self, action_vec: np.ndarray, increment_count: bool = True, 
-                              log_message: str = None, error_context: str = "action") -> None:
+    def _publish_action_vector(
+        self,
+        action_vec: np.ndarray,
+        increment_count: bool = True,
+        log_message: str = None,
+        error_context: str = "action",
+        chunk_id: int = -1,
+        step_index: int = -1,
+    ) -> None:
         """Publish an action vector with consistent error handling.
         
         Args:
@@ -606,11 +880,18 @@ class PolicyBridge(Node):
             increment_count: Whether to increment the publish counter
             log_message: Optional message to log after successful publish
             error_context: Context string for error messages
+            chunk_id: Debug trace id for chunk inference (-1 if unknown / safety)
+            step_index: Step within chunk (-1 if unknown / safety)
         """
+        published_ok = False
         try:
             # Handle multiple action specs by splitting the action vector
             if len(self._action_specs) > 1:
-                self._publish_multiple_actions(action_vec, increment_count, log_message, error_context)
+                published_ok = self._publish_multiple_actions(
+                    action_vec, increment_count, log_message, error_context
+                )
+                if published_ok:
+                    self.get_logger().info(f"Published {len(self._action_specs)} action specs")
             else:
                 # Single action spec (original behavior)
                 msg = encode_value(
@@ -620,11 +901,20 @@ class PolicyBridge(Node):
                     clamp=getattr(self._act_spec, "clamp", None),
                 )
                 self._act_pub.publish(msg)
-
+                self.get_logger().info(f"Published single action spec")
+                self.get_logger().info(f"Action vector shape: {action_vec.shape}")
+                self.get_logger().info(f"Action vector: {action_vec}")
+                
                 if increment_count:
                     self._pub_count += 1
                 if log_message:
                     self.get_logger().info(log_message)
+                published_ok = True
+
+            if published_ok and (
+                self._debug_exec_pub is not None or self._run_log_dir() is not None
+            ):
+                self._publish_executed_debug(action_vec, chunk_id, step_index)
 
         except (RuntimeError, ValueError, TypeError) as e:
             action_type = getattr(self._act_spec, "ros_type", "unknown")
@@ -636,9 +926,17 @@ class PolicyBridge(Node):
                 f"(type={action_type}, names_count={names_count}, vec_len={vec_len})"
             )
 
-    def _publish_multiple_actions(self, action_vec: np.ndarray, increment_count: bool = True,
-                                log_message: str = None, error_context: str = "action") -> None:
-        """Publish action vector to multiple action specs by splitting based on names."""
+    def _publish_multiple_actions(
+        self,
+        action_vec: np.ndarray,
+        increment_count: bool = True,
+        log_message: str = None,
+        error_context: str = "action",
+    ) -> bool:
+        """Publish action vector to multiple action specs by splitting based on names.
+
+        Returns True if at least one spec was published successfully.
+        """
         start_idx = 0
         published_count = 0
         
@@ -683,11 +981,28 @@ class PolicyBridge(Node):
             self._pub_count += 1
         if log_message and published_count > 0:
             self.get_logger().info(f"{log_message} (published to {published_count} topics)")
+        return published_count > 0
 
     def _publish_safety_command(self, increment_count: bool = True, log_message: str = None) -> None:
         """Publish safety command (zeros or hold last action)."""
         safety_vec = self._create_safety_vector()
-        self._publish_action_vector(safety_vec, increment_count, log_message, "safety")
+        self._publish_action_vector(
+            safety_vec,
+            increment_count,
+            log_message,
+            "safety",
+            chunk_id=-1,
+            step_index=-1,
+        )
+
+    def _reference_cmd_cb(self, msg: TwistStamped) -> None:
+        try:
+            v = decode_value("geometry_msgs/msg/TwistStamped", msg, self._act_spec)
+            arr = np.asarray(v, dtype=np.float64).ravel()
+            with self._ref_lock:
+                self._ref_vec = arr.copy()
+        except (TypeError, ValueError, AttributeError, KeyError) as e:
+            self.get_logger().warning(f"reference_cmd decode failed: {e!r}")
 
     # ---------------- Sub callback ----------------
     def _obs_cb(self, msg, spec: SpecView) -> None:
@@ -697,13 +1012,28 @@ class PolicyBridge(Node):
         ts_ns = int(
             ts) if ts is not None else self.get_clock().now().nanoseconds
         val = decode_value(spec.ros_type, msg, spec)
-        if val is not None:
-            # Mirror the subscription key used at construction time
-            if spec.key == "observation.state" and len(self._state_specs) > 1:
-                dict_key = f"{spec.key}_{spec.topic.replace('/', '_')}"
-            else:
-                dict_key = spec.key
-            self._subs[dict_key].buf.push(ts_ns, val)
+        if val is None:
+            # if self._bridge_debug:
+            #     self.get_logger().warning(
+            #         f"[bridge_debug] decode_value None → no buffer push: topic={spec.topic} "
+            #         f"key={spec.key} type={spec.ros_type} ts_ns={ts_ns}"
+            #     )
+            return
+        # Mirror the subscription key used at construction time
+        if spec.key == "observation.state" and len(self._state_specs) > 1:
+            dict_key = f"{spec.key}_{spec.topic.replace('/', '_')}"
+        else:
+            dict_key = spec.key
+        buf = self._subs[dict_key].buf
+        buf.push(ts_ns, val)
+        # StreamBuffer is not a list: it keeps a single latest sample (last_ts, last_val).
+        # if self._bridge_debug:
+        #     self.get_logger().info(
+        #         f"[bridge_debug] stored observation key={dict_key} topic={spec.topic} "
+        #         f"stored_samples={buf.stored_sample_count()} "
+        #         f"payload={observation_stored_footprint(buf.last_val)} "
+        #         f"last_ts={buf.last_ts} policy={buf.policy} tol_ns={buf.tol_ns}"
+        #     )
 
     # ---------------- Producer: timer tick (persistent) ----------------
     def _producer_tick(self) -> None:
@@ -725,6 +1055,7 @@ class PolicyBridge(Node):
         """Run policy inference and enqueue actions. Returns number produced."""
         use_chunks = self._params.use_chunks
         k = self._params.actions_per_chunk
+        self.get_logger().info(f"Producer tick: use_chunks={use_chunks} actions_per_chunk={k}")
         thr = float(self._params.chunk_size_threshold)
 
         produced = 0
@@ -754,6 +1085,13 @@ class PolicyBridge(Node):
         if sample_t_ns is None:
             sample_t_ns = self.get_clock().now().nanoseconds
 
+        # if self._bridge_debug:
+        #     self.get_logger().info(
+        #         f"[bridge_debug] _produce_actions sample_t_ns={sample_t_ns} "
+        #         f"now_ns={self.get_clock().now().nanoseconds} "
+        #         f"use_header_time={self._params.use_header_time}"
+        #     )
+
         obs_frame = self._sample_obs_frame(sample_t_ns)
         batch = self._prepare(obs_frame)
         batch = self.preprocessor(batch)
@@ -776,6 +1114,21 @@ class PolicyBridge(Node):
                         self.get_logger().error(f"Traceback: {traceback.format_exc()}")
                         return 0
 
+                    self._chunk_counter += 1
+                    cid = self._chunk_counter
+                    ax, ay, ayaw = self._snapshot_chunk_anchor_odom()
+                    self._chunk_anchors[cid] = (ax, ay, ayaw)
+                    if self._debug_chunk_log_dir and not (
+                        math.isfinite(ax) and math.isfinite(ay) and math.isfinite(ayaw)
+                    ):
+                        self.get_logger().warning(
+                            f"Chunk {cid}: no valid odometry for CSV anchor yet "
+                            f"(check chunk_log_anchor_odom_topic); anchor_* will be nan"
+                        )
+                    chunk_np = chunk.detach().cpu().float().numpy()
+                    self._publish_debug_predicted_chunk(cid, chunk_np)
+                    self._save_predicted_chunk_npy(cid, chunk_np)
+
                     # 2) Always schedule publishes on the node clock,
                     #    aligned to the next execution tick and in the future.
                     now_wall = self.get_clock().now().nanoseconds
@@ -789,12 +1142,20 @@ class PolicyBridge(Node):
                                     chunk[i].detach().cpu().numpy(),
                                     dtype=np.float32, #TODO: We might want to have the option to use other dtypes
                                 ).ravel(),
+                                cid,
+                                i,
                             )
                         )
                         produced = k
+                    if self._producer_buffer:
+                        self.get_logger().info(
+                            f"[dbg] enqueued {len(self._producer_buffer)} actions "
+                            f"sched=[{self._producer_buffer[0][0]}..{self._producer_buffer[-1][0]}]"
+                        )
                 else:
                     try:
                         a = self.policy.select_action(batch)
+                        
                         self.get_logger().info(f"Generated single action shape: {a.shape}")
                         a = self._postprocess_actions(a)
                         self.get_logger().info(f"Postprocessed single action shape: {a.shape}")
@@ -803,26 +1164,48 @@ class PolicyBridge(Node):
                         import traceback
                         self.get_logger().error(f"Traceback: {traceback.format_exc()}")
                         return 0
+                    act_vec = np.asarray(
+                        a[0].detach().cpu().numpy(), dtype=np.float32
+                    ).ravel()
+                    self._chunk_counter += 1
+                    cid = self._chunk_counter
+                    ax, ay, ayaw = self._snapshot_chunk_anchor_odom()
+                    self._chunk_anchors[cid] = (ax, ay, ayaw)
+                    if self._debug_chunk_log_dir and not (
+                        math.isfinite(ax) and math.isfinite(ay) and math.isfinite(ayaw)
+                    ):
+                        self.get_logger().warning(
+                            f"Chunk {cid}: no valid odometry for CSV anchor yet "
+                            f"(check chunk_log_anchor_odom_topic); anchor_* will be nan"
+                        )
+                    self._publish_debug_predicted_chunk(cid, act_vec)
+                    self._save_predicted_chunk_npy(cid, act_vec)
+                    if self._predicted_action_pub is not None:
+                        self._predicted_action_pub.publish(
+                            self._float32_multiarray_1d(act_vec)
+                        )
                     now_wall = self.get_clock().now().nanoseconds
                     t0 = self._next_exec_tick_ns(now_wall + self.step_ns)
-                    self._producer_buffer.append(
-                        (
-                            t0,
-                            np.asarray(
-                                a[0].detach().cpu().numpy(), dtype=np.float32
-                            ).ravel(),
-                        )
-                    )
+                    self._producer_buffer.append((t0, act_vec, cid, 0))
                     produced = 1
 
         if self._producer_buffer:
             with self._queue_lock:
                 self._queue.extend(self._producer_buffer)
 
+        batch_summary = []
+        for bk, v in batch.items():
+            if torch.is_tensor(v):
+                batch_summary.append(f"{bk}=tensor{tuple(v.shape)}:{v.dtype}")
+            else:
+                batch_summary.append(f"{bk}={type(v).__name__}")
+        self.get_logger().info("[dbg] inference input: " + ", ".join(batch_summary))
+
         return produced
 
     # ---------------- Executor: timer tick (persistent) ----------------
     def _executor_tick(self) -> None:
+        self.get_logger().info(f"Executor tick started  with queue length: {len(self._queue)}")
         if not self._running_event.is_set() or self._finishing.is_set():
             return
 
@@ -849,7 +1232,7 @@ class PolicyBridge(Node):
             # Find best action after cleanup
             best_idx = -1
             best_abs = None
-            for idx, (t_ns, _) in enumerate(self._queue):
+            for idx, (t_ns, _, _, _) in enumerate(self._queue):
                 d = abs(t_ns - now_ns)
                 if best_abs is None or d < best_abs:
                     best_abs, best_idx = d, idx
@@ -868,10 +1251,12 @@ class PolicyBridge(Node):
             # Remove all actions before the best one
             for _ in range(best_idx):
                 self._queue.popleft()
-            _t_sel, act_vec = self._queue.popleft()
+            _t_sel, act_vec, chunk_id, step_index = self._queue.popleft()
 
         self._last_action = act_vec
-        self._publish_action_vector(act_vec)
+        self._publish_action_vector(
+            act_vec, chunk_id=chunk_id, step_index=step_index
+        )
 
 
     def _get_most_recent_image_timestamp(self) -> Optional[int]:
@@ -897,12 +1282,23 @@ class PolicyBridge(Node):
         if most_recent_ts is not None:
             skew_ms = (self.get_clock().now().nanoseconds - most_recent_ts) / 1e6
             self.get_logger().info(f"obs-header skew: {skew_ms:.1f} ms")
+        
+            # Verificar skew de otros sensores
+            for key, sub_state in self._subs.items():
+                if key not in image_keys:
+                    latest_ts = getattr(sub_state.buf, 'last_ts', None)
+                    if latest_ts:
+                        sensor_skew = (most_recent_ts - latest_ts) / 1e6
+                        # self.get_logger().info(
+                        #     f"⏰ [{key}] skew vs image: {sensor_skew:.1f}ms"
+                        # )
                     
         return most_recent_ts
 
     # ---------------- Observation sampling ----------------
     def _sample_obs_frame(self, sample_t_ns: int) -> Dict[str, Any]:
         obs_frame: Dict[str, Any] = {}
+        zero_padded_keys = []
         
         # Handle multiple observation.state specs by consolidating them
         if len(self._state_specs) > 1:
@@ -914,7 +1310,16 @@ class PolicyBridge(Node):
                     if v is None:
                         zp = self._obs_zero[dict_key]
                         v = zp.copy() if isinstance(zp, np.ndarray) else zp
-                        self.get_logger().warning(f"Observation {dict_key} is None, zero padding")
+                        self.get_logger().warning(
+                            f"Observation {dict_key} is None, zero padding"
+                        )
+                        if self._bridge_debug:
+                            st = self._subs[dict_key]
+                            self.get_logger().warning(
+                                f"[bridge_debug] zero-pad reason [{dict_key}] "
+                                f"topic={st.spec.topic} sample_t_ns={sample_t_ns}: "
+                                f"{st.buf.sample_miss_reason(sample_t_ns)}"
+                            )
                     state_parts.append(v)
                 else:
                     # Fallback to zero padding if subscription missing
@@ -935,13 +1340,38 @@ class PolicyBridge(Node):
                 
             v = st.buf.sample(sample_t_ns)
             if v is None:
+                zero_padded_keys.append(key)
                 zp = self._obs_zero[key]
                 obs_frame[key] = zp.copy() if isinstance(
                     zp, np.ndarray) else zp
                 self.get_logger().warning(f"Observation {key} is None, zero padding")
+                if self._bridge_debug:
+                    self.get_logger().warning(
+                        f"[bridge_debug] zero-pad reason [{key}] "
+                        f"topic={st.spec.topic} sample_t_ns={sample_t_ns}: "
+                        f"{st.buf.sample_miss_reason(sample_t_ns)}"
+                    )
             else:
                 obs_frame[key] = v
+
+        if zero_padded_keys:
+            self.get_logger().warning(
+                f"⚠️ Zero-padded {len(zero_padded_keys)} observations: "
+                f"{', '.join(zero_padded_keys)}"
+            )
+            
         obs_frame["task"] = self._prompt
+        summary = []
+        for k, v in obs_frame.items():
+            if k == "task":
+                summary.append(f"{k}=str(len={len(v)})")
+            elif isinstance(v, np.ndarray):
+                summary.append(f"{k}=ndarray{tuple(v.shape)}")
+            else:
+                summary.append(f"{k}={type(v).__name__}")
+        # self.get_logger().info(
+        #     f"[dbg] sampled obs for inference at sample_t_ns={sample_t_ns}: " + ", ".join(summary)
+        # )
         return obs_frame
 
     # ---------------- Batch preparation ----------------

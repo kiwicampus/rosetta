@@ -50,6 +50,7 @@ setup(
             'episode_recorder = rosetta.episode_recorder:main',
             'policy_bridge_node = rosetta.policy_bridge_node:main',
             'policy_visualizer_node = rosetta.policy_visualizer_node:main',
+            'foxglove_image_bridge_node = rosetta.foxglove_image_bridge_node:main',
         ],
     },
 )

@@ -1,0 +1,79 @@
+name: rover_diff_drive
+version: 1
+
+
+robot_type: rover
+rate_hz: 5.0 
+max_duration_s: 120.0
+
+metadata:
+  task:
+    type: constant
+    value: rover_diff_drive
+
+observations:
+
+  - key: observation.image.main
+    topic: /camera/color/image_raw
+    # type: sensor_msgs/msg/CompressedImage
+    type: sensor_msgs/msg/Image
+    image: 
+      resize: [360,640]
+    align: {strategy: closest, stamp: header, tol_ms: 4000}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+  
+  # - key: observation.image.left
+  #   topic: /video_mapping/left/image_raw
+  #   # type: sensor_msgs/msg/CompressedImage
+  #   type: sensor_msgs/msg/Image
+  #   image: 
+  #     resize: [360,640]
+  #   align: {strategy: closest, stamp: header, tol_ms: 2000}
+  #   qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  # - key: observation.image.right
+  #   topic: /video_mapping/right/image_raw
+  #   # type: sensor_msgs/msg/CompressedImage
+  #   type: sensor_msgs/msg/Image
+  #   image: 
+  #     resize: [360,640]
+  #   align: {strategy: closest, stamp: header, tol_ms: 2000}
+  #   qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  # - key: observation.image.rear
+  #   topic: /video_mapping/rear/image_raw
+  #   # type: sensor_msgs/msg/CompressedImage
+  #   type: sensor_msgs/msg/Image
+  #   image: 
+  #     resize: [360,640]
+  #   align: {strategy: closest, stamp: header, tol_ms: 1000}
+  #   qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.state
+    topic: /odometry/local
+    type: nav_msgs/msg/Odometry 
+    selector:
+      names: [
+        twist.twist.linear.x, twist.twist.angular.z
+      ]
+    align: {strategy: closest, stamp: header, tol_ms: 1000}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
+
+actions:
+  - key: action
+    publish:
+      topic: /gps/filtered
+      type: sensor_msgs/msg/NavSatFix
+      layout: flat
+      qos: {reliability: best_effort, history: keep_last, depth: 10}
+      strategy:
+        mode: nearest
+        tolerance_ms: 500
+    selector:
+      names: [latitude, longitude]
+    lookahead_n: 1        # stack N future steps; change to 10 for 10-waypoint horizon
+    safety_behavior: zeros
+
+recording:
+  storage: mcap

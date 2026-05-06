@@ -536,6 +536,54 @@ class StreamBuffer:
         else:
             return None
 
+    def sample_miss_reason(self, tick_ns: int) -> str:
+        """Explain why sample(tick_ns) would return None (for diagnostics)."""
+        if self.last_ts is None:
+            return (
+                "buffer empty: no observation pushed yet "
+                "(no messages, wrong topic, QoS mismatch, or decode_value returned None)"
+            )
+        if self.policy == "drop":
+            if self.last_ts > tick_ns - self.step_ns:
+                return "policy=drop: unexpected (sample should succeed)"
+            dt = tick_ns - self.last_ts
+            return (
+                f"policy=drop: last_ts={self.last_ts} is not > tick_ns-step_ns={tick_ns - self.step_ns} "
+                f"(latest sample is dt={dt} ns / {dt / 1e6:.1f} ms older than allowed step_ns={self.step_ns})"
+            )
+        if self.policy in ("asof", "closest"):
+            age = tick_ns - self.last_ts
+            if age <= self.tol_ns:
+                return f"policy={self.policy}: unexpected (age {age} ns within tol_ns {self.tol_ns})"
+            return (
+                f"policy={self.policy}: observation too stale for tick_ns: "
+                f"age=tick_ns-last_ts={age} ns ({age / 1e6:.1f} ms) > tol_ns={self.tol_ns} "
+                f"({self.tol_ns / 1e6:.1f} ms). "
+            )
+        if self.policy == "hold":
+            return "policy=hold: unexpected empty (last_ts set but sample returned None)"
+        return f"unknown resample policy={self.policy!r}"
+
+    def stored_sample_count(self) -> int:
+        """Number of samples retained (0 or 1): StreamBuffer only keeps the latest."""
+        return 1 if self.last_val is not None else 0
+
+
+def observation_stored_footprint(val: Any) -> str:
+    """Size/shape summary for a decoded observation stored in StreamBuffer.last_val."""
+    if val is None:
+        return "None"
+    if isinstance(val, np.ndarray):
+        return (
+            f"ndarray shape={tuple(val.shape)} dtype={val.dtype} "
+            f"nbytes={val.nbytes} numel={val.size}"
+        )
+    if isinstance(val, str):
+        return f"str len={len(val)}"
+    if isinstance(val, (list, tuple)):
+        return f"{type(val).__name__} len={len(val)}"
+    return f"{type(val).__name__}"
+
 
 # ---------- Encoders (numpy -> ROS) ----------
 
