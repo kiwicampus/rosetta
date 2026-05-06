@@ -172,6 +172,27 @@ def _enc_i32_array(
     return msg
 
 
+@register_encoder("sensor_msgs/msg/NavSatFix")
+def _enc_navsatfix(
+    names: List[str], action_vec: Sequence[float], clamp: Optional[Tuple[float, float]]
+):
+    """NavSatFix encoder: names present → dotted-path assignment; default → lat, lon, alt."""
+    if names:
+        return _encode_via_dotted_paths("sensor_msgs/msg/NavSatFix", names, action_vec, clamp)
+    msg_cls = get_message("sensor_msgs/msg/NavSatFix")
+    msg = msg_cls()
+    arr = np.asarray(action_vec, dtype=np.float32).reshape(-1)
+    if clamp:
+        arr = np.clip(arr, clamp[0], clamp[1])
+    if len(arr) >= 1:
+        msg.latitude = float(arr[0])
+    if len(arr) >= 2:
+        msg.longitude = float(arr[1])
+    if len(arr) >= 3:
+        msg.altitude = float(arr[2])
+    return msg
+
+
 @register_encoder("control_msgs/msg/MultiDOFCommand")
 def _enc_multidof_command(
     names: List[str], action_vec: Sequence[float], clamp: Optional[Tuple[float, float]]

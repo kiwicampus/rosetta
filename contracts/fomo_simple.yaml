@@ -63,16 +63,18 @@ observations:
 actions:
   - key: action
     publish:
-      topic: /gps/filtered
-      type: sensor_msgs/msg/NavSatFix
+      topic: /motion_control/speed_controller/reference_cmd
+      type: geometry_msgs/msg/TwistStamped
       layout: flat
       qos: {reliability: best_effort, history: keep_last, depth: 10}
       strategy:
-        mode: nearest
-        tolerance_ms: 500
+        mode: nearest  # 'fifo' | 'nearest' - nearest selects action closest to current time
+        tolerance_ms: 500  
     selector:
-      names: [latitude, longitude]
-    lookahead_n: 1        # stack N future steps; change to 10 for 10-waypoint horizon
+      names: [twist.linear.x, twist.angular.z]
+      #names: [twist.linear.x, twist.linear.y, twist.linear.z, twist.angular.x, twist.angular.y, twist.angular.z] 
+    from_tensor:
+      clamp: [-2.0, 2.0]
     safety_behavior: zeros
 
 recording:

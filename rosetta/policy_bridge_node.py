@@ -27,7 +27,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from nav_msgs.msg import Odometry, Path
+from nav_msgs.msg import Odometry, Path as NavPath
 from sensor_msgs.msg import NavSatFix
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension, MultiArrayLayout
 from std_srvs.srv import Trigger
@@ -138,6 +138,14 @@ class PolicyBridge(Node):
         )
         # Odometry pose sampled when each chunk is generated (for executed.csv anchors).
         self.declare_parameter("chunk_log_anchor_odom_topic", "/odometry/local")
+        # nav_msgs/Path publisher for RViz visualization of predicted trajectory.
+        self.declare_parameter("waypoint_path_topic", "predicted_waypoints")
+        # GPS viz: Path is in this frame (often map). Twist viz: ignored when odometry is available —
+        # Path uses the same parent frame as chunk_log_anchor_odom (e.g. odom) so XY matches pose.pose.
+        self.declare_parameter("waypoint_path_frame", "map")
+        self.declare_parameter("gps_ref_topic", "/gps/filtered")
+        # "auto" = infer from ros_type; "gps" = flat-earth lat/lon; "twist" = unicycle v/omega.
+        self.declare_parameter("waypoint_path_mode", "auto")
 
         self._params = self._read_params()
         self._bridge_debug = bool(self.get_parameter("bridge_debug").value)
@@ -297,6 +305,24 @@ class PolicyBridge(Node):
         # For backward compatibility, keep the first spec as the "primary" one
         self._act_spec = self._action_specs[0]
 
+        # Action type detection: use ros_type from contract publish.type
+        self._action_is_gps   = (self._act_spec.ros_type == "sensor_msgs/msg/NavSatFix")
+        self._action_is_twist = (self._act_spec.ros_type == "geometry_msgs/msg/TwistStamped")
+        # Visualization mode: "auto" infers from ros_type; "gps" or "twist" forces the interpretation.
+        _viz_mode = str(self.get_parameter("waypoint_path_mode").value or "auto").strip().lower()
+        if _viz_mode == "gps":
+            self._viz_is_gps, self._viz_is_twist = True, False
+        elif _viz_mode == "twist":
+            self._viz_is_gps, self._viz_is_twist = False, True
+        else:  # auto
+            self._viz_is_gps   = self._action_is_gps
+            self._viz_is_twist = self._action_is_twist
+        # GPS reference lock/origin (GPS viz mode only; updated by _gps_ref_cb)
+        self._gps_ref_lock = threading.Lock()
+        self._gps_ref: Optional[Tuple[float, float]] = None  # (lat0, lon0)
+        # Last predicted chunk — kept so the path can be republished on every producer tick.
+        self._last_chunk_np: Optional[np.ndarray] = None
+
         self.fps = int(self._contract.rate_hz)
         if self.fps <= 0:
             raise ValueError("Contract rate_hz must be >= 1")
@@ -361,10 +387,12 @@ class PolicyBridge(Node):
 
         self._odom_lock = threading.Lock()
         self._last_odom_xyyaw: Optional[Tuple[float, float, float]] = None
+        # Parent frame of the odometry pose (e.g. "odom"); must match Path.header when integrating v/w in world XY.
+        self._odom_frame_id: Optional[str] = None
         anchor_topic = str(
             self.get_parameter("chunk_log_anchor_odom_topic").value or ""
         ).strip()
-        if self._debug_chunk_log_dir and anchor_topic:
+        if anchor_topic and (self._debug_chunk_log_dir or self._viz_is_twist):
             odom_qos = QoSProfile(
                 depth=10,
                 reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -436,6 +464,32 @@ class PolicyBridge(Node):
             self.get_logger().info(
                 f"Debug executed-action publisher: '{dbg_exec_topic}'"
             )
+
+        wp_path_topic = str(self.get_parameter("waypoint_path_topic").value or "").strip()
+        self._waypoint_path_frame = str(self.get_parameter("waypoint_path_frame").value or "map")
+        gps_ref_topic = str(self.get_parameter("gps_ref_topic").value or "").strip()
+
+        self._waypoint_path_pub: Optional[Any] = None
+        if wp_path_topic and (self._viz_is_gps or self._viz_is_twist):
+            self._waypoint_path_pub = self.create_publisher(
+                NavPath, wp_path_topic, QoSProfile(depth=10)
+            )
+            self.get_logger().info(
+                f"Waypoint path publisher: '{wp_path_topic}' (nav_msgs/Path, mode={_viz_mode})"
+            )
+            if self._viz_is_gps and gps_ref_topic:
+                gps_qos = QoSProfile(
+                    depth=10,
+                    reliability=ReliabilityPolicy.BEST_EFFORT,
+                    history=HistoryPolicy.KEEP_LAST,
+                )
+                self.create_subscription(
+                    NavSatFix, gps_ref_topic, self._gps_ref_cb,
+                    gps_qos, callback_group=self._cbg,
+                )
+                self.get_logger().info(
+                    f"GPS reference subscription: '{gps_ref_topic}'"
+                )
 
         self._cancel_srv = self.create_service(
             Trigger, f"{_ACTION_NAME}/cancel", self._cancel_service_cb,
@@ -581,8 +635,85 @@ class PolicyBridge(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         yaw = math.atan2(siny_cosp, cosy_cosp)
+        fid = (msg.header.frame_id or "").strip()
         with self._odom_lock:
             self._last_odom_xyyaw = (float(p.x), float(p.y), float(yaw))
+            if fid:
+                self._odom_frame_id = fid
+
+    def _gps_ref_cb(self, msg: NavSatFix) -> None:
+        with self._gps_ref_lock:
+            self._gps_ref = (float(msg.latitude), float(msg.longitude))
+
+    def _publish_waypoint_path(self, chunk_np: np.ndarray) -> None:
+        if self._waypoint_path_pub is None:
+            return
+
+        now = self.get_clock().now().to_msg()
+        path_msg = NavPath()
+        path_msg.header.stamp = now
+        if self._viz_is_twist:
+            # Integrated (x,y) are in the odometry parent frame (e.g. odom), not base_link or map.
+            with self._odom_lock:
+                odom_fid = self._odom_frame_id
+            path_msg.header.frame_id = (
+                (odom_fid or "").strip()
+                or str(self._waypoint_path_frame or "").strip()
+                or "odom"
+            )
+        else:
+            path_msg.header.frame_id = self._waypoint_path_frame
+
+        def _make_pose(x: float, y: float, yaw: float = 0.0) -> PoseStamped:
+            ps = PoseStamped()
+            ps.header = path_msg.header
+            ps.pose.position.x = x
+            ps.pose.position.y = y
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.z = math.sin(yaw / 2.0)
+            ps.pose.orientation.w = math.cos(yaw / 2.0)
+            return ps
+
+        if self._viz_is_gps:
+            # GPS mode: flat-earth lat/lon → local XY (east=+X, north=+Y)
+            # TODO: support lookahead_n > 1 (chunk_np cols > 2, rows contain N lat/lon pairs)
+            with self._gps_ref_lock:
+                if self._gps_ref is None:
+                    return
+                lat0, lon0 = self._gps_ref
+            METERS_PER_DEG = 111319.9
+            cos_lat0 = math.cos(math.radians(lat0))
+            path_msg.poses.append(_make_pose(0.0, 0.0))  # robot origin
+            for i in range(chunk_np.shape[0]):
+                lat = float(chunk_np[i, 0])  # col 0 = latitude
+                lon = float(chunk_np[i, 1])  # col 1 = longitude
+                x = (lon - lon0) * cos_lat0 * METERS_PER_DEG  # east
+                y = (lat - lat0) * METERS_PER_DEG              # north
+                path_msg.poses.append(_make_pose(x, y))
+
+        elif self._viz_is_twist:
+            # Twist mode: integrate unicycle kinematics from current odometry
+            # TODO: support lookahead_n > 1 (chunk_np cols > 2, rows contain N [v, w] pairs)
+            with self._odom_lock:
+                if self._last_odom_xyyaw is None:
+                    return
+                x0, y0, yaw0 = self._last_odom_xyyaw
+            dt = self.step_sec
+            x, y, th = x0, y0, yaw0
+            path_msg.poses.append(_make_pose(x, y, th))
+            for i in range(chunk_np.shape[0]):
+                v = float(chunk_np[i, 0])  # col 0 = linear.x
+                w = float(chunk_np[i, 1])  # col 1 = angular.z
+                if not math.isfinite(v): v = 0.0
+                if not math.isfinite(w): w = 0.0
+                x += v * math.cos(th) * dt
+                y += v * math.sin(th) * dt
+                th += w * dt
+                path_msg.poses.append(_make_pose(x, y, th))
+        else:
+            return
+
+        self._waypoint_path_pub.publish(path_msg)
 
     def _snapshot_chunk_anchor_odom(self) -> Tuple[float, float, float]:
         with self._odom_lock:
@@ -1065,6 +1196,8 @@ class PolicyBridge(Node):
                 queue_length == 0 or (k > 0 and (queue_length / max(1, k)) <= thr)
             )
         if use_chunks and not need_chunk:
+            if self._last_chunk_np is not None:
+                self._publish_waypoint_path(self._last_chunk_np)
             return 0
 
         self._producer_buffer.clear()
@@ -1126,8 +1259,10 @@ class PolicyBridge(Node):
                             f"(check chunk_log_anchor_odom_topic); anchor_* will be nan"
                         )
                     chunk_np = chunk.detach().cpu().float().numpy()
+                    self._last_chunk_np = chunk_np
                     self._publish_debug_predicted_chunk(cid, chunk_np)
                     self._save_predicted_chunk_npy(cid, chunk_np)
+                    self._publish_waypoint_path(chunk_np)
 
                     # 2) Always schedule publishes on the node clock,
                     #    aligned to the next execution tick and in the future.
@@ -1178,8 +1313,10 @@ class PolicyBridge(Node):
                             f"Chunk {cid}: no valid odometry for CSV anchor yet "
                             f"(check chunk_log_anchor_odom_topic); anchor_* will be nan"
                         )
+                    self._last_chunk_np = act_vec.reshape(1, -1)
                     self._publish_debug_predicted_chunk(cid, act_vec)
                     self._save_predicted_chunk_npy(cid, act_vec)
+                    self._publish_waypoint_path(self._last_chunk_np)
                     if self._predicted_action_pub is not None:
                         self._predicted_action_pub.publish(
                             self._float32_multiarray_1d(act_vec)
