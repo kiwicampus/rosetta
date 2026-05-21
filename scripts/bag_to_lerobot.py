@@ -1038,6 +1038,24 @@ def export_bags_to_lerobot(
             )
             print(f"  [GPS] Resampled {len(gps_ts)} /gps/filtered messages to {n_ticks} frames (waypoints: lon, lat)")
 
+        # Precompute episode-start position for odometry actions (pose.pose.position x/y).
+        # Actions are stored as cumulative displacement from pos[0], so the final
+        # waypoint equals total episode displacement (goal pose in odometry frame).
+        _odom_episode_start: Dict[str, np.ndarray] = {}
+        for _ak, _aspecs in action_specs_by_key.items():
+            if any(
+                sv.ros_type == "nav_msgs/msg/Odometry"
+                and any("pose.pose.position" in n for n in sv.names)
+                for sv in _aspecs
+            ):
+                _vals = []
+                for sv in _aspecs:
+                    _ukey = f"{sv.key}_{sv.topic.replace('/', '_')}"
+                    _v0 = resampled.get(_ukey, [None] * n_ticks)[0]
+                    if _v0 is not None:
+                        _vals.append(np.asarray(_v0, dtype=np.float32).reshape(-1))
+                _odom_episode_start[_ak] = np.concatenate(_vals) if _vals else np.zeros(2, dtype=np.float32)
+
         # Write frames
         print(f"Processing {n_ticks} frames...")
 
@@ -1096,16 +1114,39 @@ def export_bags_to_lerobot(
                             vals.append(np.asarray(stream_val, dtype=np.float32).reshape(-1))
                     return np.concatenate(vals) if vals else None
 
-                if la_n == 0:
-                    val = _read_tick(i)
-                    frame[action_key] = val if val is not None else zero_pad_map[action_key]
+                # Odometry position actions are stored as cumulative displacement from
+                # episode start (pos[0]), so each waypoint is pos[j] - pos[0] in meters.
+                # The final frame's action equals the total episode displacement (goal pose).
+                is_odom_position_action = any(
+                    sv.ros_type == "nav_msgs/msg/Odometry"
+                    and any("pose.pose.position" in n for n in sv.names)
+                    for sv in action_specs
+                )
+
+                if is_odom_position_action:
+                    origin = _odom_episode_start.get(action_key, np.zeros(single_size, dtype=np.float32))
+
+                    if la_n == 0:
+                        raw = _read_tick(i)
+                        frame[action_key] = (raw - origin) if raw is not None else zero_pad_map[action_key]
+                    else:
+                        steps = []
+                        for step in range(1, la_n + 1):
+                            j = min(i + step, n_ticks - 1)
+                            raw = _read_tick(j)
+                            steps.append((raw - origin) if raw is not None else np.zeros(single_size, dtype=np.float32))
+                        frame[action_key] = np.concatenate(steps)
                 else:
-                    steps = []
-                    for step in range(1, la_n + 1):
-                        j = min(i + step, n_ticks - 1)
-                        val = _read_tick(j)
-                        steps.append(val if val is not None else np.zeros(single_size, dtype=np.float32))
-                    frame[action_key] = np.concatenate(steps)
+                    if la_n == 0:
+                        val = _read_tick(i)
+                        frame[action_key] = val if val is not None else zero_pad_map[action_key]
+                    else:
+                        steps = []
+                        for step in range(1, la_n + 1):
+                            j = min(i + step, n_ticks - 1)
+                            val = _read_tick(j)
+                            steps.append(val if val is not None else np.zeros(single_size, dtype=np.float32))
+                        frame[action_key] = np.concatenate(steps)
 
             # Process all other features
             for name in write_keys:
