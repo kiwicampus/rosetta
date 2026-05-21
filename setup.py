@@ -21,10 +21,10 @@ setup(
         (os.path.join('share', package_name, 'contracts'), glob('contracts/*.yaml')),
         # Include all parameter files
         (os.path.join('share', package_name, 'params'), glob('params/*.yaml')),
-        # Install anonymize_daemon.py so anonymizer.py can find it at runtime
+        # Install daemon scripts so anonymizer.py can find them at runtime
         # (path resolves to site-packages/scripts/ from the installed anonymizer.py)
         (os.path.join('lib', 'python3.10', 'site-packages', 'scripts'),
-            glob('scripts/anonymize_daemon.py')),
+            glob('scripts/anonymize_daemon.py') + glob('scripts/anonymize_daemon_yolo.py')),
     ],
     # This is important as well
     install_requires=['setuptools'],
