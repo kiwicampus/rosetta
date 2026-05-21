@@ -80,13 +80,14 @@ def _resolve_daemon() -> tuple:
     """
     weights_dir = ANON_REPO / "weights"
     yolo_face = weights_dir / "yolov8n_face.pt"
-    yolo_plate = weights_dir / "yolov8n_plate.pt"
+    yolo_plate_v5 = weights_dir / "yolov5m_plate.pt"
+    yolo_plate_v8 = weights_dir / "yolov8n_plate.pt"
 
     if (
         _YOLO_ENV_PYTHON.exists()
         and YOLO_DAEMON_SCRIPT.exists()
         and yolo_face.exists()
-        and yolo_plate.exists()
+        and (yolo_plate_v5.exists() or yolo_plate_v8.exists())
     ):
         return _YOLO_ENV_PYTHON, YOLO_DAEMON_SCRIPT, True
 

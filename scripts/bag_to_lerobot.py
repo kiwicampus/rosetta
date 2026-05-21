@@ -1438,27 +1438,68 @@ def _ensure_anon_weights() -> None:
         if not weights_dir.exists()
         else weights_dir
     )
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- TF1.15 Faster-RCNN weights (fallback daemon) ---
     face_pb = weights_dir / "weights_face_v1.0.0.pb"
     plate_pb = weights_dir / "weights_plate_v1.0.0.pb"
 
-    if face_pb.exists() and plate_pb.exists():
-        return
+    if not (face_pb.exists() and plate_pb.exists()):
+        print("[Anonymizer] TF weight files not found – downloading from GCS …")
+        cmd = [
+            "gsutil", "-m", "cp",
+            "gs://autonomy-vision/models/anonymization/weights_face_v1.0.0.pb",
+            "gs://autonomy-vision/models/anonymization/weights_plate_v1.0.0.pb",
+            str(weights_dir) + "/",
+        ]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Failed to download anonymization weights. "
+                "Make sure gsutil is installed and you are authenticated."
+            )
+        print("[Anonymizer] TF weights downloaded successfully.")
 
-    print("[Anonymizer] Weight files not found – downloading from GCS …")
-    weights_dir.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "gsutil", "-m", "cp",
-        "gs://autonomy-vision/models/anonymization/weights_face_v1.0.0.pb",
-        "gs://autonomy-vision/models/anonymization/weights_plate_v1.0.0.pb",
-        str(weights_dir) + "/",
-    ]
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        raise RuntimeError(
-            "Failed to download anonymization weights. "
-            "Make sure gsutil is installed and you are authenticated."
-        )
-    print("[Anonymizer] Weights downloaded successfully.")
+    # --- YOLO weights (fast daemon) ---
+    yolo_face_pt = weights_dir / "yolov8n_face.pt"
+    yolo_plate_pt = weights_dir / "yolov5m_plate.pt"
+
+    if not (yolo_face_pt.exists() and yolo_plate_pt.exists()):
+        print("[Anonymizer] YOLO weight files not found – downloading from HuggingFace …")
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError:
+            print(
+                "[Anonymizer] WARNING: huggingface_hub not installed; skipping YOLO weights. "
+                "Will fall back to slower TF daemon (~350 ms/frame)."
+            )
+            return
+
+        tmp_cache = weights_dir / ".cache"
+        try:
+            if not yolo_face_pt.exists():
+                print("[Anonymizer]   Downloading yolov8n_face.pt …")
+                hf_hub_download(
+                    repo_id="arnabdhar/YOLOv8-Face-Detection",
+                    filename="model.pt",
+                    local_dir=str(weights_dir),
+                )
+                (weights_dir / "model.pt").rename(yolo_face_pt)
+
+            if not yolo_plate_pt.exists():
+                print("[Anonymizer]   Downloading yolov5m_plate.pt …")
+                hf_hub_download(
+                    repo_id="keremberke/yolov5m-license-plate",
+                    filename="best.pt",
+                    local_dir=str(weights_dir),
+                )
+                (weights_dir / "best.pt").rename(yolo_plate_pt)
+        finally:
+            if tmp_cache.exists():
+                import shutil
+                shutil.rmtree(tmp_cache, ignore_errors=True)
+
+        print("[Anonymizer] YOLO weights downloaded successfully.")
 
 
 def main() -> None:
