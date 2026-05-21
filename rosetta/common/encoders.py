@@ -11,6 +11,7 @@ the @register_encoder decorator and called via encode_value() in processing_util
 Supported message types:
 - geometry_msgs/msg/Twist: Convert to Twist messages for robot control
 - geometry_msgs/msg/TwistStamped: Convert to TwistStamped messages for robot control with timestamp
+- nav_msgs/msg/Odometry: Flat vector via dotted selector paths (e.g. pose.pose.position.*)
 - std_msgs/msg/Float32MultiArray: Convert to Float32MultiArray messages
 - std_msgs/msg/Int32MultiArray: Convert to Int32MultiArray messages
 """
@@ -132,6 +133,29 @@ def _enc_twist_stamped(
     if len(arr) >= 6:
         msg.twist.angular.y = float(arr[5])
 
+    return msg
+
+
+@register_encoder("nav_msgs/msg/Odometry")
+def _enc_odometry(
+    names: List[str], action_vec: Sequence[float], clamp: Optional[Tuple[float, float]]
+):
+    """Odometry encoder: selector names → dotted-path fields; default → pose.position x,y,z."""
+    if names:
+        return _encode_via_dotted_paths(
+            "nav_msgs/msg/Odometry", names, action_vec, clamp
+        )
+    msg_cls = get_message("nav_msgs/msg/Odometry")
+    msg = msg_cls()
+    arr = np.asarray(action_vec, dtype=np.float32).reshape(-1)
+    if clamp:
+        arr = np.clip(arr, clamp[0], clamp[1])
+    if len(arr) >= 1:
+        msg.pose.pose.position.x = float(arr[0])
+    if len(arr) >= 2:
+        msg.pose.pose.position.y = float(arr[1])
+    if len(arr) >= 3:
+        msg.pose.pose.position.z = float(arr[2])
     return msg
 
 

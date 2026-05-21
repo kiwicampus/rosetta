@@ -140,11 +140,11 @@ class PolicyBridge(Node):
         self.declare_parameter("chunk_log_anchor_odom_topic", "/odometry/local")
         # nav_msgs/Path publisher for RViz visualization of predicted trajectory.
         self.declare_parameter("waypoint_path_topic", "predicted_waypoints")
-        # GPS viz: Path is in this frame (often map). Twist viz: ignored when odometry is available —
-        # Path uses the same parent frame as chunk_log_anchor_odom (e.g. odom) so XY matches pose.pose.
+        # GPS viz: Path in this frame. Twist viz: uses anchor odometry parent frame when available.
+        # Waypoints viz (nav_msgs/Odometry actions or mode=waypoints): Path in waypoint_path_frame.
         self.declare_parameter("waypoint_path_frame", "map")
         self.declare_parameter("gps_ref_topic", "/gps/filtered")
-        # "auto" = infer from ros_type; "gps" = flat-earth lat/lon; "twist" = unicycle v/omega.
+        # auto = infer (NavSatFix→gps, Twist*→integrate v/w, Odometry→plot x,y rows); gps | twist | waypoints.
         self.declare_parameter("waypoint_path_mode", "auto")
 
         self._params = self._read_params()
@@ -306,17 +306,15 @@ class PolicyBridge(Node):
         self._act_spec = self._action_specs[0]
 
         # Action type detection: use ros_type from contract publish.type
-        self._action_is_gps   = (self._act_spec.ros_type == "sensor_msgs/msg/NavSatFix")
-        self._action_is_twist = (self._act_spec.ros_type == "geometry_msgs/msg/TwistStamped")
-        # Visualization mode: "auto" infers from ros_type; "gps" or "twist" forces the interpretation.
-        _viz_mode = str(self.get_parameter("waypoint_path_mode").value or "auto").strip().lower()
-        if _viz_mode == "gps":
-            self._viz_is_gps, self._viz_is_twist = True, False
-        elif _viz_mode == "twist":
-            self._viz_is_gps, self._viz_is_twist = False, True
-        else:  # auto
-            self._viz_is_gps   = self._action_is_gps
-            self._viz_is_twist = self._action_is_twist
+        self._action_is_gps = self._act_spec.ros_type == "sensor_msgs/msg/NavSatFix"
+        self._action_is_twist = self._act_spec.ros_type == "geometry_msgs/msg/TwistStamped"
+        # Local waypoint actions (e.g. pose.pose.position x,y in odom) — no unicycle integration.
+        self._action_is_odom_xy = self._act_spec.ros_type == "nav_msgs/msg/Odometry"
+        
+        self._viz_is_gps = self._action_is_gps
+        self._viz_is_twist = self._action_is_twist
+        self._viz_is_waypoints_xy = self._action_is_odom_xy
+
         # GPS reference lock/origin (GPS viz mode only; updated by _gps_ref_cb)
         self._gps_ref_lock = threading.Lock()
         self._gps_ref: Optional[Tuple[float, float]] = None  # (lat0, lon0)
@@ -470,12 +468,11 @@ class PolicyBridge(Node):
         gps_ref_topic = str(self.get_parameter("gps_ref_topic").value or "").strip()
 
         self._waypoint_path_pub: Optional[Any] = None
-        if wp_path_topic and (self._viz_is_gps or self._viz_is_twist):
+        if wp_path_topic and (
+            self._viz_is_gps or self._viz_is_twist or self._viz_is_waypoints_xy
+        ):
             self._waypoint_path_pub = self.create_publisher(
                 NavPath, wp_path_topic, QoSProfile(depth=10)
-            )
-            self.get_logger().info(
-                f"Waypoint path publisher: '{wp_path_topic}' (nav_msgs/Path, mode={_viz_mode})"
             )
             if self._viz_is_gps and gps_ref_topic:
                 gps_qos = QoSProfile(
@@ -710,6 +707,17 @@ class PolicyBridge(Node):
                 y += v * math.sin(th) * dt
                 th += w * dt
                 path_msg.poses.append(_make_pose(x, y, th))
+
+        elif self._viz_is_waypoints_xy:
+            # Flat (x, y[, yaw]) per horizon step in waypoint_path_frame (e.g. odom) — not integrated v/w.
+            path_msg.header.frame_id = (
+                str(self._waypoint_path_frame or "").strip() or "odom"
+            )
+            for i in range(chunk_np.shape[0]):
+                x = float(chunk_np[i, 0])
+                y = float(chunk_np[i, 1])
+                yaw = 0.0
+                path_msg.poses.append(_make_pose(x, y, yaw))
         else:
             return
 
@@ -721,9 +729,32 @@ class PolicyBridge(Node):
                 return (float("nan"), float("nan"), float("nan"))
             return self._last_odom_xyyaw
 
-    def _reference_row_for_csv(self, n_d: int) -> list[float]:
-        """Align decoded reference (TwistStamped via primary spec names) to n_d columns; pad with nan."""
-        if not self._reference_cmd_topic or n_d <= 0:
+    def _reference_row_for_csv(self, n_d: int, chunk_id: int = -1) -> list[float]:
+        """Return reference values for CSV logging, or [] to omit the ref columns entirely.
+
+        For odom-position actions: actual displacement from chunk anchor at execution time,
+        i.e. ref_di = current_odom_i - anchor_i  (local relative displacement).
+        For twist actions: latest TwistStamped from the reference_cmd_topic (unchanged).
+        """
+        if n_d <= 0:
+            return []
+
+        if self._action_is_odom_xy:
+            with self._odom_lock:
+                odom = self._last_odom_xyyaw
+            if odom is None:
+                return [float("nan")] * n_d
+            anchor = self._chunk_anchors.get(chunk_id)
+            if anchor is None:
+                return [float("nan")] * n_d
+            rel = [odom[0] - anchor[0], odom[1] - anchor[1]]
+            row = [float("nan")] * n_d
+            for i, v in enumerate(rel[:n_d]):
+                row[i] = float(v)
+            return row
+
+        # Twist mode: latest TwistStamped reference command (existing behaviour, unchanged).
+        if not self._reference_cmd_topic:
             return []
         with self._ref_lock:
             if self._ref_vec is None:
@@ -748,7 +779,7 @@ class PolicyBridge(Node):
         path = d / "executed.csv"
         vec = np.asarray(action_vec, dtype=np.float32).ravel()
         n_d = int(vec.size)
-        ref_suffix = self._reference_row_for_csv(n_d)
+        ref_suffix = self._reference_row_for_csv(n_d, chunk_id=chunk_id)
         write_header = (not path.exists()) or (not self._exec_csv_header_written)
         with path.open("a", newline="") as f:
             w = csv.writer(f)
@@ -985,15 +1016,19 @@ class PolicyBridge(Node):
         self._done_event.set()
 
     def _create_safety_vector(self) -> np.ndarray:
-        """Create safety action vector (zeros or hold last action)."""
-        if self._safety_behavior == "hold" and self._last_action is not None:
+        """Create safety action vector.
+        Position mode: hold last valid coordinate (zeros would send robot to training-frame origin).
+        Velocity mode: zeros (stop).
+        """
+        if self._action_is_odom_xy:
+            if self._last_action is not None:
+                return self._last_action.copy()
+        elif self._safety_behavior == "hold" and self._last_action is not None:
             return self._last_action.copy()
-        else:
-            # Calculate total action vector size for all specs
-            total_size = sum(len(spec.names or []) for spec in self._action_specs)
-            if total_size == 0:
-                total_size = 2  # fallback minimum
-            return np.zeros((total_size,), dtype=np.float32)
+        total_size = sum(len(spec.names or []) for spec in self._action_specs)
+        if total_size == 0:
+            total_size = 2
+        return np.zeros((total_size,), dtype=np.float32)
 
     def _publish_action_vector(
         self,
@@ -1186,7 +1221,6 @@ class PolicyBridge(Node):
         """Run policy inference and enqueue actions. Returns number produced."""
         use_chunks = self._params.use_chunks
         k = self._params.actions_per_chunk
-        self.get_logger().info(f"Producer tick: use_chunks={use_chunks} actions_per_chunk={k}")
         thr = float(self._params.chunk_size_threshold)
 
         produced = 0
@@ -1342,10 +1376,9 @@ class PolicyBridge(Node):
 
     # ---------------- Executor: timer tick (persistent) ----------------
     def _executor_tick(self) -> None:
-        self.get_logger().info(f"Executor tick started  with queue length: {len(self._queue)}")
         if not self._running_event.is_set() or self._finishing.is_set():
             return
-
+        self.get_logger().info(f"Executor tick started  with queue length: {len(self._queue)}")
         now_ns = self.get_clock().now().nanoseconds
 
         # Warmup: widen tolerance x4 and avoid noisy warnings
