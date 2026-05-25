@@ -1496,6 +1496,24 @@ def _ensure_anon_weights() -> None:
 
         print("[Anonymizer] YOLO weights downloaded successfully.")
 
+    # --- YuNet ONNX weights (fast daemon face detector) ---
+    yunet_onnx = weights_dir / "face_detection_yunet_2023mar.onnx"
+    if not yunet_onnx.exists():
+        print("[Anonymizer] YuNet ONNX weights not found – downloading from OpenCV model zoo …")
+        import urllib.request
+
+        yunet_url = (
+            "https://github.com/opencv/opencv_zoo/raw/main/models/"
+            "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+        )
+        try:
+            urllib.request.urlretrieve(yunet_url, str(yunet_onnx))
+            print("[Anonymizer] YuNet ONNX weights downloaded successfully.")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to download YuNet ONNX weights from {yunet_url}: {exc}"
+            ) from exc
+
 
 def main() -> None:
     """CLI entry point for batch conversion of ROS 2 bags to LeRobot."""
