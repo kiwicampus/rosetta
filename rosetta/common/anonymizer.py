@@ -65,33 +65,35 @@ CONDA_PYTHON = _GPU_ENV_PYTHON if _GPU_ENV_PYTHON.exists() else _CPU_ENV_PYTHON
 # YOLO daemon uses the anon_env_yolo conda environment (PyTorch + ultralytics)
 _YOLO_ENV_PYTHON = Path("/opt/conda/envs/anon_env_yolo/bin/python")
 YOLO_DAEMON_SCRIPT = _ROSETTA_ROOT / "scripts" / "anonymize_daemon_yolo.py"
-DAEMON_SCRIPT = _ROSETTA_ROOT / "scripts" / "anonymize_daemon.py"
-ANON_REPO = _WORKSPACE_SRC / "offline-anonymization"
+WEIGHTS_DIR = _ROSETTA_ROOT / "weights"
 
 def _resolve_daemon() -> tuple:
-    """Return (python_path, daemon_script, use_yolo) for the best available daemon.
+    """Return (python_path, daemon_script) for the YOLO anonymization daemon.
 
-    Prefer the YOLO daemon (anon_env_yolo + anonymize_daemon_yolo.py) when:
-      - anon_env_yolo Python is available
-      - YOLO daemon script exists
-      - Both yolov8n_face.pt and yolov8n_plate.pt weights are present
-
-    Falls back to the TF1.15 daemon otherwise.
+    Raises RuntimeError if the daemon environment or weights are not available.
+    Run bag_to_lerobot.py with --anonymize to trigger automatic weight download.
     """
-    weights_dir = ANON_REPO / "weights"
-    yolo_face = weights_dir / "yolov8n_face.pt"
-    yolo_plate_v5 = weights_dir / "yolov5m_plate.pt"
-    yolo_plate_v8 = weights_dir / "yolov8n_plate.pt"
+    yolo_face = WEIGHTS_DIR / "yolov8n_face.pt"
+    yolo_plate_v5 = WEIGHTS_DIR / "yolov5m_plate.pt"
+    yolo_plate_v8 = WEIGHTS_DIR / "yolov8n_plate.pt"
 
-    if (
-        _YOLO_ENV_PYTHON.exists()
-        and YOLO_DAEMON_SCRIPT.exists()
-        and yolo_face.exists()
-        and (yolo_plate_v5.exists() or yolo_plate_v8.exists())
-    ):
-        return _YOLO_ENV_PYTHON, YOLO_DAEMON_SCRIPT, True
+    missing = []
+    if not _YOLO_ENV_PYTHON.exists():
+        missing.append(f"anon_env_yolo not found at {_YOLO_ENV_PYTHON}")
+    if not YOLO_DAEMON_SCRIPT.exists():
+        missing.append(f"daemon script not found at {YOLO_DAEMON_SCRIPT}")
+    if not yolo_face.exists():
+        missing.append(f"yolov8n_face.pt not found in {WEIGHTS_DIR}")
+    if not (yolo_plate_v5.exists() or yolo_plate_v8.exists()):
+        missing.append(f"no plate model found in {WEIGHTS_DIR}")
+    if missing:
+        raise RuntimeError(
+            "Anonymization daemon unavailable:\n"
+            + "\n".join(f"  - {m}" for m in missing)
+            + "\nRun bag_to_lerobot.py with --anonymize to download missing weights."
+        )
 
-    return CONDA_PYTHON, DAEMON_SCRIPT, False
+    return _YOLO_ENV_PYTHON, YOLO_DAEMON_SCRIPT
 
 
 # Chunk size per daemon IPC call.  For the YOLO daemon this is a GPU batch size.
@@ -115,11 +117,10 @@ class _DaemonWorker:
         self._chunk_size = chunk_size
         self._worker_id = worker_id
 
-        conda_python, daemon_script, use_yolo = _resolve_daemon()
-        self._use_yolo = use_yolo
+        conda_python, daemon_script = _resolve_daemon()
 
         env = os.environ.copy()
-        env["ANON_REPO_PATH"] = str(ANON_REPO)
+        env["ANON_WEIGHTS_DIR"] = str(WEIGHTS_DIR)
         env.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
         # Prepend real driver lib so CUDA forward-compat libs don't shadow it
         real_driver_lib = "/usr/lib/x86_64-linux-gnu"
@@ -241,26 +242,12 @@ class FrameAnonymizer:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         num_workers: int = DEFAULT_NUM_WORKERS,
     ):
-        if not ANON_REPO.exists():
-            raise RuntimeError(
-                f"offline-anonymization submodule not found at {ANON_REPO}.\n"
-                "Run: git submodule update --init ros2_workspace/src/offline-anonymization"
-            )
-
-        # Check which daemon will be used
-        _, daemon_script, use_yolo = _resolve_daemon()
-        if use_yolo:
-            print(
-                f"[FrameAnonymizer] Using YOLO daemon ({daemon_script.name}) — "
-                "fast GPU inference (~10 ms/frame).",
-                flush=True,
-            )
-        else:
-            print(
-                f"[FrameAnonymizer] Using TF1.15 daemon ({daemon_script.name}) — "
-                "YOLO weights not found, falling back to Faster-RCNN (~350 ms/frame).",
-                flush=True,
-            )
+        _, daemon_script = _resolve_daemon()
+        print(
+            f"[FrameAnonymizer] Using YOLO daemon ({daemon_script.name}) — "
+            "fast GPU inference (~10 ms/frame).",
+            flush=True,
+        )
 
         self._gpu = gpu
         self._chunk_size = chunk_size

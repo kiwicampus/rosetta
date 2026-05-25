@@ -1432,12 +1432,7 @@ def _ensure_anon_weights() -> None:
     """Download anonymization weight files if they are missing."""
     import subprocess
 
-    weights_dir = Path(__file__).parent.parent.parent / "offline-anonymization" / "weights"
-    weights_dir = (
-        Path("/workspace/ros2_workspace/src/offline-anonymization/weights")
-        if not weights_dir.exists()
-        else weights_dir
-    )
+    weights_dir = Path(__file__).parent.parent / "weights"
     weights_dir.mkdir(parents=True, exist_ok=True)
 
     # --- TF1.15 Faster-RCNN weights (fallback daemon) ---

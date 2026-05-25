@@ -43,11 +43,9 @@ if _real_driver not in _LD:
 # Configurable paths / thresholds
 # ---------------------------------------------------------------------------
 
-ANON_REPO_PATH = os.environ.get("ANON_REPO_PATH", "")
-WEIGHTS_DIR = os.environ.get(
-    "ANON_WEIGHTS_DIR",
-    os.path.join(ANON_REPO_PATH, "weights") if ANON_REPO_PATH else "",
-)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_WEIGHTS_DIR = os.path.join(os.path.dirname(_SCRIPT_DIR), "weights")
+WEIGHTS_DIR = os.environ.get("ANON_WEIGHTS_DIR", _DEFAULT_WEIGHTS_DIR)
 
 YOLO_FACE_WEIGHTS  = os.path.join(WEIGHTS_DIR, "yolov8n_face.pt")
 PLATE_WEIGHTS_V5   = os.path.join(WEIGHTS_DIR, "yolov5m_plate.pt")   # primary (better recall)
