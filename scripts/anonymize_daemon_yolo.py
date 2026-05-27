@@ -5,7 +5,7 @@ Fast anonymization daemon using YOLOv8 + OpenCV YuNet + PyTorch (GPU).
 
 Face detection:  OpenCV YuNet (primary)  +  YOLOv8n face (secondary ensemble)
 Plate detection: YOLOv8n  with aspect-ratio / edge-proximity sanity filter
-Blur:            scipy Gaussian (sigma=12)
+Blur:            OpenCV GaussianBlur (sigma=12)
 
 Quality fixes vs naive YOLO approach:
   - BGR conversion before YOLO (ultralytics expects OpenCV BGR, not RGB)
@@ -106,7 +106,9 @@ def _load_models():
         )
         plate_model.conf = PLATE_THRESHOLD
         plate_model.to(device)
-        print(f"[anonymize_daemon_yolo] Plate model: yolov5m (better recall)", file=sys.stderr, flush=True)
+        if device == "cuda":
+            plate_model.half()
+        print(f"[anonymize_daemon_yolo] Plate model: yolov5m (better recall, {'fp16' if device == 'cuda' else 'fp32'})", file=sys.stderr, flush=True)
     else:
         plate_model = YOLO(PLATE_WEIGHTS)
         plate_model.to(device)
@@ -120,7 +122,7 @@ def _load_models():
     print(f"[anonymize_daemon_yolo] YuNet OK. Warming up YOLO …", file=sys.stderr, flush=True)
 
     dummy = np.zeros((64, 64, 3), dtype=np.uint8)
-    yolo_face.predict(dummy, verbose=False, device=device)
+    yolo_face.predict(dummy, verbose=False, device=device, half=(device == "cuda"))
     if use_v5_plate:
         plate_model([dummy])
     else:
@@ -281,14 +283,14 @@ def _anonymize_batch(yolo_face, plate_model, device, use_v5_plate: bool, batch: 
         sub_end = min(sub_start + BATCH_SIZE, N)
         sub_bgr = frames_bgr[sub_start:sub_end]
 
-        face_results = yolo_face.predict(sub_bgr, verbose=False, device=device, conf=YOLO_FACE_THRESHOLD)
+        face_results = yolo_face.predict(sub_bgr, verbose=False, device=device, conf=YOLO_FACE_THRESHOLD, half=(device == "cuda"))
 
         # yolov5 hub API vs yolov8 ultralytics API
         if use_v5_plate:
             plate_results_v5 = plate_model(sub_bgr)  # returns Results with .xyxy list
             plate_boxes_per_img = [plate_results_v5.xyxy[j].cpu().numpy() for j in range(len(sub_bgr))]
         else:
-            plate_results_v8 = plate_model.predict(sub_bgr, verbose=False, device=device, conf=PLATE_THRESHOLD)
+            plate_results_v8 = plate_model.predict(sub_bgr, verbose=False, device=device, conf=PLATE_THRESHOLD, half=(device == "cuda"))
             plate_boxes_per_img = [
                 (pr.boxes.xyxy.cpu().numpy() if pr.boxes is not None and len(pr.boxes) > 0 else np.zeros((0, 4)))
                 for pr in plate_results_v8
