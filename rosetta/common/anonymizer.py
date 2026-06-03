@@ -31,6 +31,7 @@ Binary protocol (big-endian uint32):
   Shutdown → stdin:  [0 0 0 0] (16-byte zero header, poison pill)
 """
 
+import concurrent.futures as _cf
 import os
 import struct
 import subprocess
@@ -116,7 +117,10 @@ class _DaemonWorker:
     def __init__(self, gpu: bool = True, chunk_size: int = DEFAULT_CHUNK_SIZE, worker_id: int = 0):
         self._chunk_size = chunk_size
         self._worker_id = worker_id
+        self._gpu = gpu
+        self._proc = self._launch_proc()
 
+    def _launch_proc(self) -> subprocess.Popen:
         conda_python, daemon_script = _resolve_daemon()
 
         env = os.environ.copy()
@@ -128,7 +132,7 @@ class _DaemonWorker:
         env["LD_LIBRARY_PATH"] = (
             f"{real_driver_lib}:{existing_ld}" if existing_ld else real_driver_lib
         )
-        if not gpu:
+        if not self._gpu:
             env["CUDA_VISIBLE_DEVICES"] = "-1"
         env["YOLO_CONFIG_DIR"] = "/tmp/ultralytics"
         env["MPLCONFIGDIR"] = "/tmp"
@@ -139,7 +143,7 @@ class _DaemonWorker:
         if os.path.isdir("/opt/torch_hub"):
             env["TORCH_HOME"] = "/opt/torch_hub"
 
-        self._proc = subprocess.Popen(
+        return subprocess.Popen(
             [str(conda_python), str(daemon_script)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -147,8 +151,28 @@ class _DaemonWorker:
             env=env,
         )
 
+    def _restart(self) -> None:
+        """Kill the hung daemon subprocess and spawn a fresh one."""
+        print(
+            f"    [Anon w{self._worker_id}] Killing hung daemon and restarting …",
+            flush=True,
+        )
+        try:
+            self._proc.kill()
+            self._proc.wait(timeout=5)
+        except Exception:
+            pass
+        self._proc = self._launch_proc()
+        print(f"    [Anon w{self._worker_id}] Daemon restarted.", flush=True)
+
     def anonymize_batch(self, frames: List[np.ndarray]) -> List[np.ndarray]:
-        """Anonymize frames in chunks and return results in order."""
+        """Anonymize frames in chunks and return results in order.
+
+        Each chunk is sent to the daemon in a background thread with a hard
+        timeout.  If the daemon hangs (CUDA stall), it is killed, restarted,
+        and the chunk is retried once.  A second failure raises — frames must
+        never be returned un-anonymized when --anonymize is active.
+        """
         if not frames:
             return frames
 
@@ -157,7 +181,17 @@ class _DaemonWorker:
         for chunk_idx, chunk_start in enumerate(range(0, len(frames), self._chunk_size)):
             chunk = frames[chunk_start : chunk_start + self._chunk_size]
             t0 = time.perf_counter()
-            anon_chunk = self._send_chunk(chunk)
+            try:
+                anon_chunk = self._send_chunk_timed(chunk)
+            except TimeoutError as exc:
+                print(
+                    f"    [Anon w{self._worker_id}] {exc} — "
+                    f"restarting daemon and retrying chunk {chunk_idx + 1}/{n_chunks}",
+                    flush=True,
+                )
+                self._restart()
+                # Mandatory retry — raises on second failure (never skip anonymization)
+                anon_chunk = self._send_chunk_timed(chunk)
             elapsed = time.perf_counter() - t0
             result.extend(anon_chunk)
             print(
@@ -167,6 +201,28 @@ class _DaemonWorker:
                 flush=True,
             )
         return result
+
+    def _send_chunk_timed(
+        self, frames: List[np.ndarray], timeout_s: float = 30.0
+    ) -> List[np.ndarray]:
+        """Run _send_chunk in a thread; raise TimeoutError if it doesn't finish in time.
+
+        Using a thread (not select) so the timeout covers both the stdin.write
+        and the stdout.read — either can block if the daemon hangs mid-inference.
+        The hung thread exits on its own once _restart() kills the daemon process
+        (broken pipe / EOF on the pipe unblocks it).
+        """
+        executor = _cf.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(self._send_chunk, frames)
+        try:
+            result = future.result(timeout=timeout_s)
+            executor.shutdown(wait=False)
+            return result
+        except _cf.TimeoutError:
+            executor.shutdown(wait=False)  # Let hung thread die when daemon is killed
+            raise TimeoutError(
+                f"[Anon w{self._worker_id}] Daemon timeout after {timeout_s:.0f}s"
+            )
 
     def shutdown(self) -> None:
         try:
@@ -197,8 +253,8 @@ class _DaemonWorker:
             chunk = self._proc.stdout.read(n - pos)
             if not chunk:
                 raise RuntimeError(
-                    f"[FrameAnonymizer worker {self._worker_id}] Daemon closed stdout "
-                    "unexpectedly. Check stderr for TF/model errors."
+                    f"[Anon w{self._worker_id}] Daemon closed stdout unexpectedly "
+                    f"after {pos}/{n} bytes. Check stderr for CUDA/model errors."
                 )
             view[pos : pos + len(chunk)] = chunk
             pos += len(chunk)

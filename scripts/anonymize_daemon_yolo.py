@@ -26,9 +26,7 @@ import math
 import os
 import struct
 import sys
-import threading
 import traceback
-from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -71,7 +69,6 @@ FACE_MAX_H_F = float(os.environ.get("ANON_FACE_MAX_H_F", "0.30"))
 BATCH_SIZE      = int(os.environ.get("ANON_BATCH_SIZE",     "32"))
 BOX_PADDING     = float(os.environ.get("ANON_BOX_PADDING",  "0.15"))
 TEMPORAL_WINDOW = int(os.environ.get("ANON_TEMPORAL_WINDOW","2"))
-YUNET_WORKERS   = int(os.environ.get("ANON_YUNET_WORKERS",  str(min(8, os.cpu_count() or 4))))
 
 # ---------------------------------------------------------------------------
 # Model loading
@@ -250,21 +247,22 @@ def _gaussian_blur_regions(frame: np.ndarray, boxes: list, sigma: float = 12.0) 
 
 _prev_face_tail: collections.deque = collections.deque(maxlen=TEMPORAL_WINDOW)
 _prev_plate_tail: collections.deque = collections.deque(maxlen=TEMPORAL_WINDOW)
-_yunet_local = threading.local()
-_yunet_pool  = ThreadPoolExecutor(max_workers=YUNET_WORKERS)
+_yunet_detector = None
+_yunet_size = (0, 0)
 
 
-def _get_yunet_thread(W, H):
-    """Return this thread's YuNet detector, reinitialising when frame size changes."""
-    if not hasattr(_yunet_local, "detector") or _yunet_local.size != (W, H):
-        _yunet_local.detector = cv2.FaceDetectorYN.create(
+def _get_yunet(W, H):
+    """Return a YuNet detector, reinitialising only when the frame size changes."""
+    global _yunet_detector, _yunet_size
+    if _yunet_detector is None or _yunet_size != (W, H):
+        _yunet_detector = cv2.FaceDetectorYN.create(
             YUNET_WEIGHTS, "", (W, H),
             score_threshold=YUNET_THRESHOLD,
             nms_threshold=0.3,
             top_k=5000,
         )
-        _yunet_local.size = (W, H)
-    return _yunet_local.detector
+        _yunet_size = (W, H)
+    return _yunet_detector
 
 
 def _anonymize_batch(yolo_face, plate_model, device, use_v5_plate: bool, batch: np.ndarray) -> np.ndarray:
@@ -272,6 +270,7 @@ def _anonymize_batch(yolo_face, plate_model, device, use_v5_plate: bool, batch: 
 
     N = batch.shape[0]
     H, W = batch.shape[1], batch.shape[2]
+    yunet = _get_yunet(W, H)
 
     all_face_boxes  = [[] for _ in range(N)]
     all_plate_boxes = [[] for _ in range(N)]
@@ -312,21 +311,14 @@ def _anonymize_batch(yolo_face, plate_model, device, use_v5_plate: bool, batch: 
                 if _is_valid_plate(x0, y0, x1, y1, H, W):
                     all_plate_boxes[idx].append(_expand_box(x0, y0, x1, y1, H, W))
 
-    # ---- YuNet face detection (parallel, per-frame) ----
-    def _run_yunet(i):
-        det = _get_yunet_thread(W, H)
-        _, faces = det.detect(frames_bgr[i])
-        if faces is None:
-            return []
-        return [
-            _expand_box(x, y, x + w, y + h, H, W)
-            for f in faces
-            for x, y, w, h in [(int(f[0]), int(f[1]), int(f[2]), int(f[3]))]
-            if _is_valid_face(x, y, x + w, y + h, H, W)
-        ]
-
-    for i, boxes in enumerate(_yunet_pool.map(_run_yunet, range(N))):
-        all_face_boxes[i].extend(boxes)
+    # ---- YuNet face detection (needs BGR, per-frame) ----
+    for i in range(N):
+        _, faces = yunet.detect(frames_bgr[i])
+        if faces is not None:
+            for f in faces:
+                x, y, w, h = int(f[0]), int(f[1]), int(f[2]), int(f[3])
+                if _is_valid_face(x, y, x + w, y + h, H, W):
+                    all_face_boxes[i].append(_expand_box(x, y, x + w, y + h, H, W))
 
     # ---- Temporal gap-fill ----
     face_ext  = list(_prev_face_tail)  + all_face_boxes
