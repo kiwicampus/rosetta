@@ -1693,10 +1693,9 @@ def main() -> None:
     else:
         raise ValueError("Either --bag or --bags must be provided")
     
-    # Build output path: out_root/input_folder_name
+    # Output directory = {out}/{repo_id}  (caller sets --repo-id to dataset_name)
     out_root = Path(args.out)
-    input_folder_name = input_path.name
-    final_out_path = out_root / input_folder_name
+    final_out_path = out_root / args.repo_id.replace("/", "_")
     
     print(f"[Output] Dataset will be saved to: {final_out_path}")
     
