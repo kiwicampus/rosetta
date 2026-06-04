@@ -232,32 +232,50 @@ class _DaemonWorker:
         H, W, C = frames[0].shape
         N = len(frames)
 
+        # Build ONE contiguous (N,H,W,C) uint8 buffer, coercing any frame that is
+        # not exactly the reference shape/dtype. This GUARANTEES the wire payload
+        # is exactly N*H*W*C bytes — a single off-shape frame (e.g. a zero-pad or
+        # odd-resolution decode) would otherwise desync the daemon's framing and
+        # crash it with an OverflowError/BrokenPipe. Robustness over a few copies.
+        arr = np.empty((N, H, W, C), dtype=np.uint8)
+        for i, f in enumerate(frames):
+            if f.shape == (H, W, C) and f.dtype == np.uint8:
+                arr[i] = f
+                continue
+            # Coerce a mismatched frame (warn once) instead of corrupting the stream.
+            if not getattr(self, "_warned_shape", False):
+                print(f"[FrameAnonymizer w{self._worker_id}] WARN: frame {i} shape "
+                      f"{getattr(f, 'shape', None)}/{getattr(f, 'dtype', None)} != "
+                      f"({H},{W},{C})/uint8 — coercing.", flush=True)
+                self._warned_shape = True
+            try:
+                g = f if f.dtype == np.uint8 else np.clip(f, 0, 255).astype(np.uint8)
+                if g.ndim == 3 and g.shape[2] == C and (g.shape[0] != H or g.shape[1] != W):
+                    import cv2
+                    g = cv2.resize(g, (W, H), interpolation=cv2.INTER_NEAREST)
+                arr[i] = g if g.shape == (H, W, C) else 0
+            except Exception:
+                arr[i] = 0
+
         if IPC_MODE == "shm":
-            nbytes = N * H * W * C
-            self._ensure_buf(nbytes)
+            self._ensure_buf(arr.nbytes)
             shm_arr = np.ndarray((N, H, W, C), dtype=np.uint8, buffer=self._mm)
-            for i, f in enumerate(frames):
-                shm_arr[i] = f  # copy each frame straight into shm (no np.stack)
+            shm_arr[:] = arr
             pb = self._buf_path.encode()
             self._proc.stdin.write(
                 struct.pack(">4I", N, H, W, C) + struct.pack(">I", len(pb)) + pb
             )
             self._proc.stdin.flush()
-            # Response: [4B M] then M × [4B idx]; modified frames are already in shm.
             n_mod = struct.unpack(">I", self._read_exactly(4))[0]
             for _ in range(n_mod):
                 idx = struct.unpack(">I", self._read_exactly(4))[0]
                 out[idx] = np.array(shm_arr[idx])  # copy out before next chunk overwrites
             return out
 
-        # pipe path — write the header then each frame's buffer directly. Avoids
-        # np.stack (N-frame copy) + .tobytes() (copy) + header concat (copy); the
-        # BufferedWriter accepts the array via the buffer protocol (zero-copy for
-        # already-contiguous frames).
+        # pipe path — header + the single contiguous buffer (exact N*H*W*C bytes).
         stdin = self._proc.stdin
         stdin.write(struct.pack(">4I", N, H, W, C))
-        for f in frames:
-            stdin.write(np.ascontiguousarray(f))
+        stdin.write(arr)              # buffer-protocol, one write, guaranteed size
         stdin.flush()
         frame_bytes = H * W * C
         n_mod = struct.unpack(">I", self._read_exactly(4))[0]

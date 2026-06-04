@@ -887,6 +887,12 @@ def export_bags_to_lerobot(
 
     # Precompute zero pads + shapes for fast frame assembly.
     zero_pad_map = {k: make_zero_pad(ft) for k, ft in features.items()}
+    # zero_pad() returns float32 for image/video features, but decoded frames are
+    # uint8. A float32 zero-pad mixed into the frame buffer (a missing/failed
+    # frame) makes the IPC payload 4x too big and desyncs the daemon. Force uint8.
+    for _k, _ft in features.items():
+        if _ft["dtype"] in ("video", "image") and isinstance(zero_pad_map.get(_k), np.ndarray):
+            zero_pad_map[_k] = zero_pad_map[_k].astype(np.uint8)
     write_keys = [
         k
         for k, ft in features.items()
