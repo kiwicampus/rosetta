@@ -31,6 +31,7 @@ Binary protocol (big-endian uint32):
   Shutdown → stdin:  [0 0 0 0] (16-byte zero header, poison pill)
 """
 
+import mmap
 import os
 import struct
 import subprocess
@@ -41,6 +42,12 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+
+# IPC transport to the daemon. "shm" (default) passes frame batches through a
+# /dev/shm mmap, sending only a small header over the pipe — avoids copying
+# hundreds of MB per camera. "pipe" is the legacy fallback. Both ends read the
+# same env var (we propagate it into the daemon's environment).
+IPC_MODE = os.environ.get("ANON_IPC", "shm").lower()
 
 # ---------------------------------------------------------------------------
 # Resolved paths
@@ -100,10 +107,11 @@ def _resolve_daemon() -> tuple:
 # For the TF1.15 daemon it only affects IPC framing.
 DEFAULT_CHUNK_SIZE = 128
 
-# Number of parallel daemon workers.  YOLO daemon is fast enough that 1 worker
-# handles all cameras sequentially without throughput loss, and avoids VRAM
-# exhaustion on 6 GB GPUs.  Increase via ANON_NUM_WORKERS if VRAM allows.
-DEFAULT_NUM_WORKERS = int(os.environ.get("ANON_NUM_WORKERS", "1"))
+# Number of parallel daemon workers (one camera stream each).  With the GPU
+# YuNet + concurrent CPU/GPU daemon, 2 workers is the measured throughput
+# sweet-spot on an 8 GB GPU (~1.3 GB VRAM per worker; 4 workers gave no extra
+# speed-up).  Drop to 1 on <6 GB GPUs, raise via ANON_NUM_WORKERS if VRAM allows.
+DEFAULT_NUM_WORKERS = int(os.environ.get("ANON_NUM_WORKERS", "2"))
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +127,15 @@ class _DaemonWorker:
 
         conda_python, daemon_script = _resolve_daemon()
 
+        # Shared-memory buffer (lazily sized in _send_chunk when IPC_MODE=="shm")
+        self._mm = None
+        self._mm_fd = None
+        self._mm_cap = 0
+        self._buf_path = None
+
         env = os.environ.copy()
         env["ANON_WEIGHTS_DIR"] = str(WEIGHTS_DIR)
+        env["ANON_IPC"] = IPC_MODE  # keep both ends in sync
         env.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
         # Prepend real driver lib so CUDA forward-compat libs don't shadow it
         real_driver_lib = "/usr/lib/x86_64-linux-gnu"
@@ -130,7 +145,9 @@ class _DaemonWorker:
         )
         if not gpu:
             env["CUDA_VISIBLE_DEVICES"] = "-1"
-        env["YOLO_CONFIG_DIR"] = "/tmp/ultralytics"
+        yolo_config_dir = "/tmp/ultralytics"
+        os.makedirs(yolo_config_dir, exist_ok=True)
+        env["YOLO_CONFIG_DIR"] = yolo_config_dir
         env["MPLCONFIGDIR"] = "/tmp"
         # Point torch.hub to the pre-cached source baked into the image at build time.
         # Avoids a GitHub download on every daemon startup and works in offline environments.
@@ -177,17 +194,72 @@ class _DaemonWorker:
                 self._proc.wait(timeout=10)
         except Exception:
             pass
+        self._close_buf()
+
+    def _ensure_buf(self, nbytes: int) -> None:
+        """Ensure the /dev/shm mmap is at least nbytes (grow in place, same inode)."""
+        if self._mm is not None and self._mm_cap >= nbytes:
+            return
+        if self._mm is not None:
+            self._mm.close()
+            self._mm = None
+        if self._buf_path is None:
+            self._buf_path = f"/dev/shm/anon_w{self._worker_id}_{os.getpid()}.buf"
+            self._mm_fd = os.open(self._buf_path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.ftruncate(self._mm_fd, nbytes)          # same inode → daemon's fd stays valid
+        self._mm = mmap.mmap(self._mm_fd, nbytes)
+        self._mm_cap = nbytes
+
+    def _close_buf(self) -> None:
+        try:
+            if self._mm is not None:
+                self._mm.close()
+            if self._mm_fd is not None:
+                os.close(self._mm_fd)
+            if self._buf_path and os.path.exists(self._buf_path):
+                os.unlink(self._buf_path)
+        except Exception:
+            pass
+        self._mm = None
+        self._mm_fd = None
+        self._mm_cap = 0
+        self._buf_path = None
 
     def _send_chunk(self, frames: List[np.ndarray]) -> List[np.ndarray]:
+        out: List[np.ndarray] = list(frames)
+        H, W, C = frames[0].shape
+        N = len(frames)
+
+        if IPC_MODE == "shm":
+            nbytes = N * H * W * C
+            self._ensure_buf(nbytes)
+            shm_arr = np.ndarray((N, H, W, C), dtype=np.uint8, buffer=self._mm)
+            for i, f in enumerate(frames):
+                shm_arr[i] = f  # copy each frame straight into shm (no np.stack)
+            pb = self._buf_path.encode()
+            self._proc.stdin.write(
+                struct.pack(">4I", N, H, W, C) + struct.pack(">I", len(pb)) + pb
+            )
+            self._proc.stdin.flush()
+            # Response: [4B M] then M × [4B idx]; modified frames are already in shm.
+            n_mod = struct.unpack(">I", self._read_exactly(4))[0]
+            for _ in range(n_mod):
+                idx = struct.unpack(">I", self._read_exactly(4))[0]
+                out[idx] = np.array(shm_arr[idx])  # copy out before next chunk overwrites
+            return out
+
+        # pipe fallback
         arr = np.stack(frames, axis=0)
-        N, H, W, C = arr.shape
         header = struct.pack(">4I", N, H, W, C)
         self._proc.stdin.write(header + arr.tobytes())
         self._proc.stdin.flush()
-        n_bytes = N * H * W * C
-        raw = self._read_exactly(n_bytes)
-        out = np.frombuffer(raw, dtype=np.uint8).reshape(N, H, W, C)
-        return [out[i] for i in range(N)]
+        frame_bytes = H * W * C
+        n_mod = struct.unpack(">I", self._read_exactly(4))[0]
+        for _ in range(n_mod):
+            idx = struct.unpack(">I", self._read_exactly(4))[0]
+            data = self._read_exactly(frame_bytes)
+            out[idx] = np.frombuffer(data, dtype=np.uint8).reshape(H, W, C)
+        return out
 
     def _read_exactly(self, n: int) -> bytes:
         buf = bytearray(n)

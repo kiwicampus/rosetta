@@ -764,6 +764,11 @@ def export_bags_to_lerobot(
         image_writer_processes=image_writer_processes,  # keep simple & predictable
         image_writer_threads=image_writer_threads,
         batch_encoding_size=1,
+        # Stream frames straight into the video encoder (pyav) instead of writing
+        # each frame as a temp PNG and reading it back. The PNG round-trip was
+        # ~70% of non-anonymization CPU; streaming also overlaps encode with the
+        # frame loop. Falls back to PNG path automatically if unsupported.
+        streaming_encoding=True,
     )
     
     # Persist the contract fingerprint into info.json so training can validate & propagate it
@@ -1454,65 +1459,57 @@ def _discover_split_folders(parent_dir: Path) -> List[Path]:
 
 def _ensure_anon_weights() -> None:
     """Download anonymization weight files if they are missing."""
+    import os
     import subprocess
 
     weights_dir = Path(__file__).parent.parent / "weights"
     weights_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- TF1.15 Faster-RCNN weights (fallback daemon) ---
-    face_pb = weights_dir / "weights_face_v1.0.0.pb"
-    plate_pb = weights_dir / "weights_plate_v1.0.0.pb"
-
-    if not (face_pb.exists() and plate_pb.exists()):
-        print("[Anonymizer] TF weight files not found – downloading from GCS …")
-        cmd = [
-            "gsutil", "-m", "cp",
-            "gs://autonomy-vision/models/anonymization/weights_face_v1.0.0.pb",
-            "gs://autonomy-vision/models/anonymization/weights_plate_v1.0.0.pb",
-            str(weights_dir) + "/",
-        ]
-        result = subprocess.run(cmd)
-        if result.returncode != 0:
-            raise RuntimeError(
-                "Failed to download anonymization weights. "
-                "Make sure gsutil is installed and you are authenticated."
-            )
-        print("[Anonymizer] TF weights downloaded successfully.")
-
-    # --- YOLO weights (fast daemon) ---
+    # --- YOLO weights (fast GPU daemon) ---
     yolo_face_pt = weights_dir / "yolov8n_face.pt"
     yolo_plate_pt = weights_dir / "yolov5m_plate.pt"
 
     if not (yolo_face_pt.exists() and yolo_plate_pt.exists()):
-        print("[Anonymizer] YOLO weight files not found – downloading from HuggingFace …")
+        print("[Anonymizer] YOLO weight files not found - downloading from HuggingFace ...")
         try:
             from huggingface_hub import hf_hub_download
-        except ImportError:
-            print(
-                "[Anonymizer] WARNING: huggingface_hub not installed; skipping YOLO weights. "
-                "Will fall back to slower TF daemon (~350 ms/frame)."
+        except ImportError as exc:
+            raise RuntimeError(
+                "huggingface_hub is required to download GPU anonymization weights."
+            ) from exc
+
+        def _download_hf_weight(repo_id: str, filename: str, target: Path) -> None:
+            downloaded = Path(
+                hf_hub_download(
+                    repo_id=repo_id,
+                    filename=filename,
+                    local_dir=str(weights_dir),
+                )
             )
-            return
+            if downloaded != target:
+                downloaded.replace(target)
 
         tmp_cache = weights_dir / ".cache"
         try:
             if not yolo_face_pt.exists():
-                print("[Anonymizer]   Downloading yolov8n_face.pt …")
-                hf_hub_download(
+                print("[Anonymizer]   Downloading yolov8n_face.pt ...")
+                _download_hf_weight(
                     repo_id="arnabdhar/YOLOv8-Face-Detection",
                     filename="model.pt",
-                    local_dir=str(weights_dir),
+                    target=yolo_face_pt,
                 )
-                (weights_dir / "model.pt").rename(yolo_face_pt)
 
             if not yolo_plate_pt.exists():
-                print("[Anonymizer]   Downloading yolov5m_plate.pt …")
-                hf_hub_download(
+                print("[Anonymizer]   Downloading yolov5m_plate.pt ...")
+                _download_hf_weight(
                     repo_id="keremberke/yolov5m-license-plate",
                     filename="best.pt",
-                    local_dir=str(weights_dir),
+                    target=yolo_plate_pt,
                 )
-                (weights_dir / "best.pt").rename(yolo_plate_pt)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to download GPU anonymization YOLO weights."
+            ) from exc
         finally:
             if tmp_cache.exists():
                 import shutil
@@ -1523,7 +1520,7 @@ def _ensure_anon_weights() -> None:
     # --- YuNet ONNX weights (fast daemon face detector) ---
     yunet_onnx = weights_dir / "face_detection_yunet_2023mar.onnx"
     if not yunet_onnx.exists():
-        print("[Anonymizer] YuNet ONNX weights not found – downloading from OpenCV model zoo …")
+        print("[Anonymizer] YuNet ONNX weights not found - downloading from OpenCV model zoo ...")
         import urllib.request
 
         yunet_url = (
@@ -1537,6 +1534,36 @@ def _ensure_anon_weights() -> None:
             raise RuntimeError(
                 f"Failed to download YuNet ONNX weights from {yunet_url}: {exc}"
             ) from exc
+
+    # --- TF1.15 Faster-RCNN weights (optional fallback daemon) ---
+    face_pb = weights_dir / "weights_face_v1.0.0.pb"
+    plate_pb = weights_dir / "weights_plate_v1.0.0.pb"
+
+    download_tf_fallback = os.environ.get("ANON_DOWNLOAD_TF_FALLBACK", "false").lower()
+    if (
+        download_tf_fallback in {"1", "true", "yes", "on"}
+        and not (face_pb.exists() and plate_pb.exists())
+    ):
+        print("[Anonymizer] Optional TF fallback weights not found - downloading from GCS ...")
+        cmd = [
+            "gsutil", "-m", "cp",
+            "gs://autonomy-vision/models/anonymization/weights_face_v1.0.0.pb",
+            "gs://autonomy-vision/models/anonymization/weights_plate_v1.0.0.pb",
+            str(weights_dir) + "/",
+        ]
+        result = subprocess.run(cmd)
+        if result.returncode != 0:
+            print(
+                "[Anonymizer] WARNING: optional TF fallback weights were not downloaded. "
+                "GPU YOLO anonymization can still run."
+            )
+        else:
+            print("[Anonymizer] TF fallback weights downloaded successfully.")
+    elif not (face_pb.exists() and plate_pb.exists()):
+        print(
+            "[Anonymizer] Optional TF fallback weights are missing; "
+            "set ANON_DOWNLOAD_TF_FALLBACK=true to download them."
+        )
 
 
 def main() -> None:

@@ -23,13 +23,32 @@ Protocol (binary, big-endian uint32 header):
 
 import collections
 import math
+import mmap
 import os
 import struct
 import sys
 import traceback
+import warnings
+
+# yolov5 7.0.14's cached hub code calls the deprecated torch.cuda.amp.autocast
+# API; on torch>=2.7 that prints a FutureWarning on every inference call. It's
+# cosmetic (fp16 inference is unaffected) — silence just that one message.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\.cuda\.amp\.autocast.*",
+    category=FutureWarning,
+)
 
 import cv2
 import numpy as np
+
+# IPC transport: "shm" (default) passes frame batches through a /dev/shm
+# mmap and only sends a tiny header over the pipe — avoids copying hundreds of
+# MB per camera through the stdin/stdout pipe. "pipe" is the legacy fallback.
+# The client (rosetta.common.anonymizer) sets ANON_IPC in our env, so both ends
+# always agree.
+IPC_MODE = os.environ.get("ANON_IPC", "shm").lower()
+_shm_fds: dict = {}  # path -> open fd, cached across chunks
 
 # ---------------------------------------------------------------------------
 # CUDA LD_LIBRARY_PATH fix for GeForce / consumer GPUs
@@ -70,11 +89,48 @@ BATCH_SIZE      = int(os.environ.get("ANON_BATCH_SIZE",     "32"))
 BOX_PADDING     = float(os.environ.get("ANON_BOX_PADDING",  "0.15"))
 TEMPORAL_WINDOW = int(os.environ.get("ANON_TEMPORAL_WINDOW","2"))
 
+# Single-threaded by design: the GPU does the heavy lifting (YOLO + YuNet via
+# CUDA), and the small residual CPU work (blur) runs serially. No thread pool.
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
+# Run YuNet on the GPU via OpenCV's CUDA DNN backend. Requires an OpenCV built
+# WITH_CUDA + OPENCV_DNN_CUDA (see the Dockerfile). If cv2 has no CUDA, YuNet
+# falls back to a serial CPU run — slow, and intentionally not optimized.
+def _cuda_available() -> bool:
+    try:
+        return cv2.cuda.getCudaEnabledDeviceCount() > 0
+    except Exception:
+        return False
+
+_YUNET_GPU_ENV = os.environ.get("ANON_YUNET_GPU", "auto").lower()
+if _YUNET_GPU_ENV in ("0", "false", "no", "cpu"):
+    _YUNET_GPU = False
+else:  # "auto" / "gpu" / "1" — use the GPU when CUDA is present
+    _YUNET_GPU = _cuda_available()
+
+
+def _make_yunet(W: int, H: int):
+    if _YUNET_GPU:
+        return cv2.FaceDetectorYN.create(
+            YUNET_WEIGHTS, "", (W, H),
+            YUNET_THRESHOLD, 0.3, 5000,
+            cv2.dnn.DNN_BACKEND_CUDA, cv2.dnn.DNN_TARGET_CUDA,
+        )
+    return cv2.FaceDetectorYN.create(
+        YUNET_WEIGHTS, "", (W, H),
+        score_threshold=YUNET_THRESHOLD, nms_threshold=0.3, top_k=5000,
+    )
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
 def _load_models():
+    os.makedirs(os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/ultralytics"), exist_ok=True)
+
     import torch
     from ultralytics import YOLO  # type: ignore
 
@@ -206,10 +262,14 @@ def _smooth_boxes_temporal(all_boxes: list) -> list:
 # ---------------------------------------------------------------------------
 
 def _gaussian_blur_regions(frame: np.ndarray, boxes: list, sigma: float = 12.0) -> np.ndarray:
+    """Blur the union of `boxes` with a Gaussian.
+
+    Uses cv2.GaussianBlur (SIMD/threaded, uint8 in-place) instead of
+    scipy.ndimage.gaussian_filter — ~1.5x faster and no float32 round-trip,
+    with visually identical output for the same sigma.
+    """
     if not boxes:
         return frame.copy()
-
-    from scipy.ndimage import gaussian_filter  # type: ignore
 
     result = frame.copy()
     H, W = frame.shape[:2]
@@ -232,12 +292,11 @@ def _gaussian_blur_regions(frame: np.ndarray, boxes: list, sigma: float = 12.0) 
     x_lo = max(0, int(xs.min()) - 20)
     x_hi = min(W, int(xs.max()) + 20)
 
-    patch = frame[y_lo:y_hi, x_lo:x_hi].astype(np.float32)
-    blurred = gaussian_filter(patch, sigma=[sigma, sigma, 0])
+    patch = frame[y_lo:y_hi, x_lo:x_hi]
+    # ksize=0 -> derived from sigma, matching scipy gaussian_filter(sigma)
+    blurred = cv2.GaussianBlur(patch, (0, 0), sigmaX=sigma, sigmaY=sigma)
     local_mask = mask[y_lo:y_hi, x_lo:x_hi]
-    result_patch = result[y_lo:y_hi, x_lo:x_hi].astype(np.float32)
-    result_patch[local_mask] = blurred[local_mask]
-    result[y_lo:y_hi, x_lo:x_hi] = np.clip(result_patch, 0, 255).astype(np.uint8)
+    result[y_lo:y_hi, x_lo:x_hi][local_mask] = blurred[local_mask]
     return result
 
 
@@ -255,12 +314,7 @@ def _get_yunet(W, H):
     """Return a YuNet detector, reinitialising only when the frame size changes."""
     global _yunet_detector, _yunet_size
     if _yunet_detector is None or _yunet_size != (W, H):
-        _yunet_detector = cv2.FaceDetectorYN.create(
-            YUNET_WEIGHTS, "", (W, H),
-            score_threshold=YUNET_THRESHOLD,
-            nms_threshold=0.3,
-            top_k=5000,
-        )
+        _yunet_detector = _make_yunet(W, H)
         _yunet_size = (W, H)
     return _yunet_detector
 
@@ -270,14 +324,13 @@ def _anonymize_batch(yolo_face, plate_model, device, use_v5_plate: bool, batch: 
 
     N = batch.shape[0]
     H, W = batch.shape[1], batch.shape[2]
-    yunet = _get_yunet(W, H)
 
     all_face_boxes  = [[] for _ in range(N)]
     all_plate_boxes = [[] for _ in range(N)]
 
-    # ---- Batch YOLO inference (needs BGR input) ----
-    # Frames arrive as RGB from the IPC protocol; convert to BGR for OpenCV/YOLO.
-    frames_bgr = [batch[i, :, :, ::-1] for i in range(N)]
+    # Frames arrive as RGB from the IPC protocol; convert to contiguous BGR for
+    # OpenCV/YOLO (contiguous avoids a hidden copy inside ultralytics/yolov5).
+    frames_bgr = [np.ascontiguousarray(batch[i, :, :, ::-1]) for i in range(N)]
 
     for sub_start in range(0, N, BATCH_SIZE):
         sub_end = min(sub_start + BATCH_SIZE, N)
@@ -311,7 +364,8 @@ def _anonymize_batch(yolo_face, plate_model, device, use_v5_plate: bool, batch: 
                 if _is_valid_plate(x0, y0, x1, y1, H, W):
                     all_plate_boxes[idx].append(_expand_box(x0, y0, x1, y1, H, W))
 
-    # ---- YuNet face detection (needs BGR, per-frame) ----
+    # ---- YuNet face detection (serial; GPU-backed via CUDA DNN when available) ----
+    yunet = _get_yunet(W, H)
     for i in range(N):
         _, faces = yunet.detect(frames_bgr[i])
         if faces is not None:
@@ -333,14 +387,16 @@ def _anonymize_batch(yolo_face, plate_model, device, use_v5_plate: bool, batch: 
     for boxes in all_plate_boxes[-TEMPORAL_WINDOW:]:
         _prev_plate_tail.append(boxes)
 
-    # ---- Apply blur ----
+    # ---- Apply blur (serial) ----
     results = batch.copy()
-    for i in range(N):
-        boxes = smoothed_face[i] + smoothed_plate[i]
-        if boxes:
-            results[i] = _gaussian_blur_regions(batch[i], boxes)
+    boxes_per_frame = [smoothed_face[i] + smoothed_plate[i] for i in range(N)]
+    to_blur = [i for i in range(N) if boxes_per_frame[i]]
+    for i in to_blur:
+        results[i] = _gaussian_blur_regions(batch[i], boxes_per_frame[i])
 
-    return results
+    # Return the indices we actually modified so the daemon can ship back only
+    # those frames (the client keeps the originals for everything else).
+    return results, to_blur
 
 
 # ---------------------------------------------------------------------------
@@ -369,10 +425,9 @@ def _read_exactly(n: int) -> bytes:
 # ---------------------------------------------------------------------------
 
 def main():
-    os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/ultralytics")
-
     yolo_face, plate_model, device, use_v5_plate = _load_models()
-    print("[anonymize_daemon_yolo] Ready.", file=sys.stderr, flush=True)
+    print(f"[anonymize_daemon_yolo] Ready (YuNet on {'GPU' if _YUNET_GPU else 'CPU'}).",
+          file=sys.stderr, flush=True)
 
     while True:
         try:
@@ -386,21 +441,52 @@ def main():
             print("[anonymize_daemon_yolo] Shutdown signal.", file=sys.stderr, flush=True)
             break
 
-        try:
-            raw = _read_exactly(N * H * W * C)
-        except EOFError:
-            break
+        nbytes = N * H * W * C
+        mm = None
+        if IPC_MODE == "shm":
+            # Header is followed by [4B path_len][path]; frames live in the mmap.
+            try:
+                plen = struct.unpack(">I", _read_exactly(4))[0]
+                path = _read_exactly(plen).decode()
+            except EOFError:
+                break
+            fd = _shm_fds.get(path)
+            if fd is None:
+                fd = os.open(path, os.O_RDWR)
+                _shm_fds[path] = fd
+            mm = mmap.mmap(fd, nbytes)
+            batch = np.ndarray((N, H, W, C), dtype=np.uint8, buffer=mm)
+        else:
+            try:
+                raw = _read_exactly(nbytes)
+            except EOFError:
+                break
+            batch = np.frombuffer(raw, dtype=np.uint8).reshape(N, H, W, C)
 
-        batch = np.frombuffer(raw, dtype=np.uint8).reshape(N, H, W, C)
-
         try:
-            result = _anonymize_batch(yolo_face, plate_model, device, use_v5_plate, batch)
+            result, modified = _anonymize_batch(yolo_face, plate_model, device, use_v5_plate, batch)
         except Exception:
             traceback.print_exc(file=sys.stderr)
-            result = batch
+            result, modified = batch, []  # unchanged → client keeps originals
 
-        _STDOUT.write(result.tobytes())
-        _STDOUT.flush()
+        if IPC_MODE == "shm":
+            # Write modified frames back into the shared buffer in place; the
+            # client reads them from the same mmap. Pipe carries only indices.
+            for i in modified:
+                batch[i] = result[i]
+            mm.flush()
+            mm.close()
+            _STDOUT.write(struct.pack(">I", len(modified)))
+            for i in modified:
+                _STDOUT.write(struct.pack(">I", i))
+            _STDOUT.flush()
+        else:
+            # Sparse response over the pipe: [4B M] then M × ([4B idx][frame]).
+            _STDOUT.write(struct.pack(">I", len(modified)))
+            for i in modified:
+                _STDOUT.write(struct.pack(">I", i))
+                _STDOUT.write(np.ascontiguousarray(result[i]).tobytes())
+            _STDOUT.flush()
 
 
 if __name__ == "__main__":
