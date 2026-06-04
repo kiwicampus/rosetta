@@ -486,6 +486,68 @@ def _clear_cache_for_bag(bag_dir: Path):
     except Exception as e:
         print(f"clear_cache_for_bag: malloc_trim not available: {e}")
 
+
+def _predecode_image_streams(bag_dir: Path, features: Dict, streams: Dict, resampled: Dict) -> None:
+    """Single-pass decode of all image/video streams for one episode.
+
+    The per-topic readers in _load_frame_from_mcap each decompress every mcap
+    chunk (chunks are multi-topic), so N cameras = N× redundant zstd
+    decompression. This reads the bag ONCE for all camera topics, decodes each
+    stream sequentially (h264 state is per-topic), and pre-fills _frame_cache for
+    exactly the log_times the resampler selected — so _load_frame_from_mcap then
+    hits the cache and never re-reads. Disable with ANON_SINGLE_PASS_DECODE=0.
+    """
+    import os
+    if os.environ.get("ANON_SINGLE_PASS_DECODE", "1") == "0":
+        return
+
+    # Collect image topics + the exact log_times each one needs.
+    topic_spec: Dict[str, Tuple[str, Any]] = {}
+    needed: Dict[str, set] = {}
+    for name, ft in features.items():
+        if ft.get("dtype") not in ("video", "image"):
+            continue
+        st = streams.get(name)
+        if st is None:
+            continue
+        topic = st.spec.topic
+        topic_spec[topic] = (st.ros_type, st.spec)
+        want = needed.setdefault(topic, set())
+        for v in resampled.get(name, []):
+            if v is not None:
+                want.add(int(v))
+    if len(topic_spec) < 2:
+        return  # single camera → no redundancy to remove
+
+    mcap_files = list(bag_dir.glob("*.mcap"))
+    if not mcap_files:
+        return
+    topics = list(topic_spec.keys())
+    decoded = 0
+    f = open(mcap_files[0], "rb")
+    try:
+        reader = make_reader(f)
+        for schema, channel, message in reader.iter_messages(topics=topics):
+            topic = channel.topic
+            ros_type, spec = topic_spec[topic]
+            lt = int(message.log_time)
+            key = (bag_dir, topic, lt)
+            if key in _frame_cache:
+                continue
+            msg = deserialize_message(message.data, get_message(ros_type))
+            # Decode every frame (h264 is sequential) but only KEEP needed ones.
+            val = decode_value(ros_type, msg, spec)
+            if val is not None and lt in needed[topic]:
+                _frame_cache[key] = val
+                decoded += 1
+    except Exception as e:
+        print(f"  [Predecode] single-pass decode aborted ({e}); falling back to per-topic readers")
+    finally:
+        f.close()
+    print(f"  [Predecode] single-pass decoded {decoded} frames across {len(topics)} camera streams "
+          f"(chunks decompressed once instead of {len(topics)}×)")
+
+
 def _plan_streams(
     specs: Iterable[Any],
     tmap: Dict[str, str],
@@ -753,6 +815,41 @@ def export_bags_to_lerobot(
     # Waypoints from /gps/filtered (sensor_msgs/NavSatFix): each waypoint is (longitude, latitude)
     features["observation.state.waypoints"] = {"dtype": "float32", "shape": (2,)}
 
+    # Cut the stats histogram cost: lerobot feeds EVERY streamed frame into a
+    # 5000-bin np.histogram (RunningQuantileStats) — ~14% of CPU. 256 bins keeps
+    # q01..q99 normalization stats well within tolerance for ~10-20x less work.
+    # Not exposed via create(), so patch the default once. Override via ANON_STATS_BINS.
+    try:
+        import os as _os
+        import lerobot.datasets.compute_stats as _cs
+        _bins = int(_os.environ.get("ANON_STATS_BINS", "256"))
+        if getattr(_cs.RunningQuantileStats.__init__, "__anon_patched__", False) is False:
+            _orig_rqs = _cs.RunningQuantileStats.__init__
+            def _rqs_init(self, quantile_list=None, num_quantile_bins=_bins, _o=_orig_rqs):
+                _o(self, quantile_list=quantile_list, num_quantile_bins=num_quantile_bins)
+            _rqs_init.__anon_patched__ = True
+            _cs.RunningQuantileStats.__init__ = _rqs_init
+    except Exception as _e:
+        print(f"[stats] could not reduce histogram bins: {_e}")
+
+    # Video quality knob. lerobot hardcodes crf=30 (→ NVENC qp=30, aggressive)
+    # and doesn't expose it via create(). Override the StreamingVideoEncoder crf
+    # to an intermediate value (default 23) for near-AV1 quality while keeping
+    # GPU NVENC. Tune via ANON_VIDEO_CRF (lower = higher quality, bigger files).
+    try:
+        import os as _os
+        import lerobot.datasets.video_utils as _vu
+        _crf = int(_os.environ.get("ANON_VIDEO_CRF", "23"))
+        if getattr(_vu.StreamingVideoEncoder.__init__, "__anon_patched__", False) is False:
+            _orig_sve = _vu.StreamingVideoEncoder.__init__
+            def _sve_init(self, *a, _o=_orig_sve, **k):
+                k["crf"] = _crf  # override hardcoded crf=30
+                _o(self, *a, **k)
+            _sve_init.__anon_patched__ = True
+            _vu.StreamingVideoEncoder.__init__ = _sve_init
+    except Exception as _e:
+        print(f"[video] could not set crf: {_e}")
+
     # Dataset
     ds = LeRobotDataset.create(
         repo_id=repo_id,
@@ -769,6 +866,10 @@ def export_bags_to_lerobot(
         # ~70% of non-anonymization CPU; streaming also overlaps encode with the
         # frame loop. Falls back to PNG path automatically if unsupported.
         streaming_encoding=True,
+        # GPU NVENC video encode ("auto" -> h264_nvenc when a CUDA GPU is present,
+        # else libsvtav1). Moves the ~17% software-encode CPU onto the GPU's
+        # dedicated NVENC block (separate from the YOLO CUDA cores).
+        vcodec="auto",
     )
     
     # Persist the contract fingerprint into info.json so training can validate & propagate it
@@ -1051,6 +1152,10 @@ def export_bags_to_lerobot(
         # tick loop unchanged and maximises GPU throughput (one inference pass
         # per episode instead of one per frame).
         _episode_frame_buffer: Optional[List[Dict]] = [] if anonymize else None
+
+        # Single-pass decode of all camera streams (1× chunk decompression instead
+        # of once per camera) — pre-fills _frame_cache for the resampled log_times.
+        _predecode_image_streams(bag_dir, features, streams, resampled)
 
         for i in range(n_ticks):
             # Print progress every 10% or every 100 frames, whichever is more frequent

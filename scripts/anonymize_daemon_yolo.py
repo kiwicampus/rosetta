@@ -30,6 +30,19 @@ import sys
 import traceback
 import warnings
 
+# ---------------------------------------------------------------------------
+# Protocol channel isolation (MUST run before importing cv2/torch/ultralytics).
+#
+# The binary IPC response is written to stdout (fd 1). If ANY library prints to
+# stdout — a banner, a progress bar, a stray print — those bytes land in the
+# binary stream, desync the client's framing, and the client then blocks
+# forever in _read_exactly waiting for bytes that never come (observed as a
+# hang). To make this impossible: preserve the real stdout for the protocol,
+# then redirect fd 1 (and sys.stdout) to stderr so all such chatter is harmless.
+_PROTO_FD = os.dup(1)        # the real stdout = the pipe to the client
+os.dup2(2, 1)                # fd 1 now points at stderr
+sys.stdout = sys.stderr      # Python-level print() (no file=) also goes to stderr
+
 # yolov5 7.0.14's cached hub code calls the deprecated torch.cuda.amp.autocast
 # API; on torch>=2.7 that prints a FutureWarning on every inference call. It's
 # cosmetic (fp16 inference is unaffected) — silence just that one message.
@@ -42,12 +55,10 @@ warnings.filterwarnings(
 import cv2
 import numpy as np
 
-# IPC transport: "shm" (default) passes frame batches through a /dev/shm
-# mmap and only sends a tiny header over the pipe — avoids copying hundreds of
-# MB per camera through the stdin/stdout pipe. "pipe" is the legacy fallback.
-# The client (rosetta.common.anonymizer) sets ANON_IPC in our env, so both ends
-# always agree.
-IPC_MODE = os.environ.get("ANON_IPC", "shm").lower()
+# IPC transport: "pipe" (default) is robust everywhere; "shm" (/dev/shm mmap) is
+# an opt-in optimization that's fragile across environments. The client
+# (rosetta.common.anonymizer) sets ANON_IPC in our env, so both ends agree.
+IPC_MODE = os.environ.get("ANON_IPC", "pipe").lower()
 _shm_fds: dict = {}  # path -> open fd, cached across chunks
 
 # ---------------------------------------------------------------------------
@@ -175,14 +186,30 @@ def _load_models():
         YUNET_WEIGHTS, "", (64, 64),
         score_threshold=YUNET_THRESHOLD, nms_threshold=0.3,
     )
-    print(f"[anonymize_daemon_yolo] YuNet OK. Warming up YOLO …", file=sys.stderr, flush=True)
+    print(f"[anonymize_daemon_yolo] YuNet OK. Warming up at real resolution …", file=sys.stderr, flush=True)
 
-    dummy = np.zeros((64, 64, 3), dtype=np.uint8)
-    yolo_face.predict(dummy, verbose=False, device=device, half=(device == "cuda"))
+    # Autotune cuDNN at the ACTUAL inference resolution + a representative batch
+    # so the first real batch doesn't eat a ~10s kernel-autotune stall (which
+    # otherwise stalls anonymization). Defaults to the contract resize 360x640;
+    # override with ANON_WARMUP_HW="H,W".
+    try:
+        _h, _w = (int(x) for x in os.environ.get("ANON_WARMUP_HW", "360,640").split(","))
+    except Exception:
+        _h, _w = 360, 640
+    # One light warmup pass to trigger CUDA context + cuDNN/cuBLAS load + model
+    # autotune at load time (overlaps the bag decode on long episodes). NOTE: the
+    # ~9s of this startup is per-process and unavoidable; on short bags it can't
+    # be hidden — it's only amortized when many bags share one daemon process.
+    dummy = np.zeros((_h, _w, 3), dtype=np.uint8)
+    warm_batch = [dummy] * min(BATCH_SIZE, 8)
+    yolo_face.predict(warm_batch, verbose=False, device=device,
+                      conf=YOLO_FACE_THRESHOLD, half=(device == "cuda"))
     if use_v5_plate:
-        plate_model([dummy])
+        plate_model(warm_batch)
     else:
-        plate_model.predict(dummy, verbose=False, device=device)
+        plate_model.predict(warm_batch, verbose=False, device=device,
+                            conf=PLATE_THRESHOLD, half=(device == "cuda"))
+    _get_yunet(_w, _h).detect(dummy)
 
     print(
         f"[anonymize_daemon_yolo] Ready  "
@@ -404,7 +431,8 @@ def _anonymize_batch(yolo_face, plate_model, device, use_v5_plate: bool, batch: 
 # ---------------------------------------------------------------------------
 
 _STDIN  = sys.stdin.buffer
-_STDOUT = sys.stdout.buffer
+# Dedicated protocol channel (preserved before fd 1 was redirected to stderr).
+_STDOUT = os.fdopen(_PROTO_FD, "wb")
 
 
 def _read_exactly(n: int) -> bytes:

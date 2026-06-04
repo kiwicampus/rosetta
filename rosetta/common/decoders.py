@@ -185,37 +185,24 @@ def decode_ros_image(
 _decoder_state = {}
 
 def create_dummy_image(msg, spec, output_encoding='rgb8'):
-    print(f"[FoxgloveDecoder] Skipping frame  (warming up)")
-    dummy = Image()
-    dummy.header.stamp = msg.timestamp
-    dummy.header.frame_id = msg.frame_id
-
+    # Numpy dummy at the target (resize) size — black frame for warmup/decode gaps.
     h, w = spec.image_resize
-    
-    print(f"[FoxgloveDecoder] Creating dummy image of size {w}x{h}")
-    dummy.height = int(h)
-    dummy.width = int(w)
-    dummy.encoding = output_encoding
-    dummy.is_bigendian = 0
-    dummy.step = dummy.width * 3
-    dummy.data = (np.zeros((dummy.height, dummy.width, 3), dtype=np.uint8)).tobytes()
-    return dummy
+    return np.zeros((int(h), int(w), 3), dtype=np.uint8)
 
 def decode_foxglove_compressed_video(msg, spec, output_encoding='rgb8', warmup_frames=30):
     """
-    Decode foxglove_msgs/CompressedVideo into a sensor_msgs/Image message using PyAV.
+    Decode foxglove_msgs/CompressedVideo (H.264) directly to an HWC rgb uint8
+    numpy array via PyAV. Returns numpy (not a ROS Image) to avoid a wasteful
+    numpy -> Image(.data=tobytes) -> numpy round-trip in the hot decode path.
+    Returns a black dummy array on warmup/decode gaps, or None on hard failure.
     """
     codec_name = getattr(msg, "format", "h264")
     topic = spec.topic
-    
 
     if topic not in _decoder_state:
         try:
             codec_ctx = av.codec.CodecContext.create(codec_name, 'r')
-            _decoder_state[topic] = {
-                'codec_ctx': codec_ctx, 
-                'prev_image': None,
-            }
+            _decoder_state[topic] = {'codec_ctx': codec_ctx, 'prev_image': None}
             print(f"[FoxgloveDecoder] Initialized decoder for topic {spec.topic}")
         except Exception as e:
             print(f"[FoxgloveDecoder] Failed to initialize decoder for {codec_name}: {e}")
@@ -223,55 +210,31 @@ def decode_foxglove_compressed_video(msg, spec, output_encoding='rgb8', warmup_f
 
     state = _decoder_state[topic]
     codec_ctx = state['codec_ctx']
-    prev_image = state['prev_image']
 
-    
-    # Wrap raw bytes from msg.data as a PyAV packet
     try:
         packet = av.packet.Packet(bytes(msg.data))
     except Exception as e:
         print(f'Failed to create AV packet: {e}')
-        return prev_image
-    
+        return state['prev_image']
+
     try:
         frames = codec_ctx.decode(packet)
     except Exception as e:
-        #dummy = create_dummy_image(msg) if prev_image is None else prev_image
-        dummy = create_dummy_image(msg, spec)
         print(f'Decode error: {e}')
-        return dummy
-    
+        return create_dummy_image(msg, spec)
 
     if not frames:
         print("[FoxgloveDecoder] No frames decoded (maybe waiting for keyframe)")
-        dummy = create_dummy_image(msg, spec)
-        return dummy
+        return create_dummy_image(msg, spec)
 
-    # Usually only one frame per packet
-    frame = frames[0]
     try:
-        img_rgb = frame.to_ndarray(format='rgb24')
-        #print("valid frame")
+        img_rgb = frames[0].to_ndarray(format='rgb24')  # HWC uint8 rgb, contiguous
     except Exception as e:
         print(f"[FoxgloveDecoder] Failed to convert frame: {e}")
         return None
 
-    h, w, ch = img_rgb.shape
-    if ch != 3:
-        print(f"[FoxgloveDecoder] Unexpected channel count {ch}, expecting 3 (rgb24)")
-
-    ros_img = Image()
-    ros_img.header.stamp = msg.timestamp
-    ros_img.header.frame_id = msg.frame_id
-    ros_img.height = h
-    ros_img.width = w
-    ros_img.encoding = output_encoding
-    ros_img.is_bigendian = 0
-    ros_img.step = w * 3
-    ros_img.data = img_rgb.tobytes()
-
-    prev_image = ros_img
-    return ros_img
+    state['prev_image'] = img_rgb
+    return img_rgb
 
 
 def decode_sensor_compressed_image_png(msg, spec):
@@ -323,20 +286,20 @@ def _dec_compressed_Image(msg,spec):
 
 @register_decoder("foxglove_msgs/msg/CompressedVideo")
 def _dec_foxglove_image(msg, spec):
-    """Foxglove CompressedVideo decoder: decode H.264 then use image decoder.
-    
-    1. Decodes the H.264 frame from the Foxglove message
-    2. Passes the resulting image to the standard image decoder (decode_ros_image)
-    3. Returns the same normalized uint8 array as sensor_msgs/Image decoding
-    
+    """Foxglove CompressedVideo decoder: H.264 -> HWC rgb uint8, resized.
+
+    Decodes straight to numpy and applies the contract resize in place — same
+    output as routing through decode_ros_image, but without the ROS-Image
+    tobytes()/frombuffer round-trip (two full-frame copies per frame).
     """
-
-    decoded_image = decode_foxglove_compressed_video(msg, spec, output_encoding='rgb8')
-    
-    # Pass resize_hw from spec to apply any configured resize
-    normalized_image = decode_ros_image(decoded_image, spec.image_encoding, spec.image_resize)
-
-    return normalized_image
+    img = decode_foxglove_compressed_video(msg, spec)  # HWC rgb uint8 numpy, or None
+    if img is None:
+        return None
+    if spec.image_resize:
+        rh, rw = int(spec.image_resize[0]), int(spec.image_resize[1])
+        if img.shape[0] != rh or img.shape[1] != rw:
+            img = _nearest_resize_rgb(img, rh, rw)
+    return np.ascontiguousarray(img, dtype=np.uint8)
 
 
 # ---------- Image decoders ----------

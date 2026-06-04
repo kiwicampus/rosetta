@@ -43,11 +43,13 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-# IPC transport to the daemon. "shm" (default) passes frame batches through a
-# /dev/shm mmap, sending only a small header over the pipe — avoids copying
-# hundreds of MB per camera. "pipe" is the legacy fallback. Both ends read the
-# same env var (we propagate it into the daemon's environment).
-IPC_MODE = os.environ.get("ANON_IPC", "shm").lower()
+# IPC transport to the daemon. "pipe" (default) is robust everywhere — it sends
+# frames over the daemon's stdin/stdout pipe. "shm" uses a /dev/shm mmap (lower
+# copy overhead) but is fragile: it needs a large /dev/shm shared between client
+# and daemon, and desyncs/hangs when that doesn't hold (different machines,
+# small /dev/shm, version skew). Opt into it with ANON_IPC=shm only when you
+# know the environment supports it. Both ends read this same env var.
+IPC_MODE = os.environ.get("ANON_IPC", "pipe").lower()
 
 # ---------------------------------------------------------------------------
 # Resolved paths
@@ -248,11 +250,15 @@ class _DaemonWorker:
                 out[idx] = np.array(shm_arr[idx])  # copy out before next chunk overwrites
             return out
 
-        # pipe fallback
-        arr = np.stack(frames, axis=0)
-        header = struct.pack(">4I", N, H, W, C)
-        self._proc.stdin.write(header + arr.tobytes())
-        self._proc.stdin.flush()
+        # pipe path — write the header then each frame's buffer directly. Avoids
+        # np.stack (N-frame copy) + .tobytes() (copy) + header concat (copy); the
+        # BufferedWriter accepts the array via the buffer protocol (zero-copy for
+        # already-contiguous frames).
+        stdin = self._proc.stdin
+        stdin.write(struct.pack(">4I", N, H, W, C))
+        for f in frames:
+            stdin.write(np.ascontiguousarray(f))
+        stdin.flush()
         frame_bytes = H * W * C
         n_mod = struct.unpack(">I", self._read_exactly(4))[0]
         for _ in range(n_mod):
@@ -326,13 +332,17 @@ class FrameAnonymizer:
         self._max_workers = max(1, num_workers)
         self._workers: List[_DaemonWorker] = []
 
-        # Spin up the first worker immediately so startup errors surface early.
+        # Eager-spawn ALL workers now (not lazily) so each daemon's model load +
+        # CUDA warmup runs concurrently with the bag decode phase that follows.
+        # Otherwise a worker spawned later (at the first anonymize_episode) pays a
+        # ~10s cold-start autotune that stalls anonymization.
         print(
-            f"[FrameAnonymizer] Starting primary daemon "
-            f"({'GPU' if gpu else 'CPU'}) … this may take a few seconds.",
+            f"[FrameAnonymizer] Starting {self._max_workers} daemon worker(s) "
+            f"({'GPU' if gpu else 'CPU'}) … warming up while frames decode.",
             flush=True,
         )
-        self._workers.append(_DaemonWorker(gpu=gpu, chunk_size=chunk_size, worker_id=0))
+        for wid in range(self._max_workers):
+            self._workers.append(_DaemonWorker(gpu=gpu, chunk_size=chunk_size, worker_id=wid))
 
     @classmethod
     def get_instance(
