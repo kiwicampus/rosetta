@@ -1,0 +1,135 @@
+robot_type: rnoid
+
+fps: 30
+max_duration_s: 90.0
+
+observations:
+  - key: observation.images.torso_rgbd
+    topic: /astribot_camera/torso_rgbd/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [720, 1280]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.left_wrist_rgbd
+    topic: /astribot_camera/left_wrist_rgbd/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [360, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.right_wrist_rgbd
+    topic: /astribot_camera/right_wrist_rgbd/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [360, 640]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.head_stereo
+    topic: /astribot_camera/head_stereo/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [420, 1280]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: observation.images.head_rgbd
+    topic: /astribot_camera/head_rgbd/color_compress/compressed
+    type: sensor_msgs/msg/CompressedImage
+    image:
+      resize: [720, 1280]
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  # Joint positions: right(7)+left(7)+head(2)+torso(4)+left_gripper(1)+right_gripper(1) = 22
+  - key: observation.state
+    topic: /astribot_arm_right/joint_space_states
+    type: astribot_msgs/msg/RobotJointState
+    selector: {names: [right.j0.pos, right.j1.pos, right.j2.pos, right.j3.pos, right.j4.pos, right.j5.pos, right.j6.pos]}
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
+  - key: observation.state
+    topic: /astribot_arm_left/joint_space_states
+    type: astribot_msgs/msg/RobotJointState
+    selector: {names: [left.j0.pos, left.j1.pos, left.j2.pos, left.j3.pos, left.j4.pos, left.j5.pos, left.j6.pos]}
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
+  - key: observation.state
+    topic: /astribot_head/joint_space_states
+    type: astribot_msgs/msg/RobotJointState
+    selector: {names: [head.j0.pos, head.j1.pos]}
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
+  - key: observation.state
+    topic: /astribot_torso/joint_space_states
+    type: astribot_msgs/msg/RobotJointState
+    selector: {names: [torso.j0.pos, torso.j1.pos, torso.j2.pos, torso.j3.pos]}
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
+  - key: observation.state
+    topic: /astribot_gripper_left/joint_space_states
+    type: astribot_msgs/msg/RobotJointState
+    selector: {names: [left_gripper.j0.pos]}
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
+  - key: observation.state
+    topic: /astribot_gripper_right/joint_space_states
+    type: astribot_msgs/msg/RobotJointState
+    selector: {names: [right_gripper.j0.pos]}
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
+actions:
+  # Joint commands: right(7)+left(7)+head(2)+torso(4)+left_gripper(1)+right_gripper(1) = 22
+  - key: action
+    selector: {names: [right.j0.pos, right.j1.pos, right.j2.pos, right.j3.pos, right.j4.pos, right.j5.pos, right.j6.pos]}
+    publish:
+      topic: /astribot_arm_right/joint_space_command
+      type: astribot_msgs/msg/RobotJointController
+      qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: action
+    selector: {names: [left.j0.pos, left.j1.pos, left.j2.pos, left.j3.pos, left.j4.pos, left.j5.pos, left.j6.pos]}
+    publish:
+      topic: /astribot_arm_left/joint_space_command
+      type: astribot_msgs/msg/RobotJointController
+      qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: action
+    selector: {names: [head.j0.pos, head.j1.pos]}
+    publish:
+      topic: /astribot_head/joint_space_command
+      type: astribot_msgs/msg/RobotJointController
+      qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: action
+    selector: {names: [torso.j0.pos, torso.j1.pos, torso.j2.pos, torso.j3.pos]}
+    publish:
+      topic: /astribot_torso/joint_space_command
+      type: astribot_msgs/msg/RobotJointController
+      qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: action
+    selector: {names: [left_gripper.j0.pos]}
+    publish:
+      topic: /astribot_gripper_left/joint_space_command
+      type: astribot_msgs/msg/RobotJointController
+      qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+  - key: action
+    selector: {names: [right_gripper.j0.pos]}
+    publish:
+      topic: /astribot_gripper_right/joint_space_command
+      type: astribot_msgs/msg/RobotJointController
+      qos: {reliability: best_effort, history: keep_last, depth: 10}
+
+recording:
+  storage: mcap

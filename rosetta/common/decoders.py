@@ -305,6 +305,75 @@ def _dec_joint_state(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
     return np.asarray(out, dtype=np.float64)
 
 
+@register_decoder('astribot_msgs/msg/RobotJointState', dtype='float64')
+def _dec_astribot_joint_state(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode astribot_msgs/RobotJointState.
+
+    When msg.name is empty (Astribot firmware omits it), spec.names are treated as
+    positional labels and msg.position is returned directly (all joints or first N).
+    """
+    if not spec.names or not msg.name:
+        pos = np.asarray(msg.position, dtype=np.float64)
+        return pos[:len(spec.names)] if spec.names else pos
+    return _dec_joint_state(msg, spec)
+
+
+@register_decoder('astribot_msgs/msg/RobotCartesianState', dtype='float64')
+def _dec_astribot_cartesian_state(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode astribot_msgs/RobotCartesianState using dot-path selectors into pose/twist/wrench."""
+    if not spec.names:
+        raise ValueError(
+            'astribot_msgs/RobotCartesianState requires explicit selector names '
+            '(e.g. "pose.position.x")'
+        )
+    return np.asarray([dot_get(msg, name) for name in spec.names], dtype=np.float64)
+
+
+@register_decoder('astribot_msgs/msg/RobotCartesianStates', dtype='float64')
+def _dec_astribot_cartesian_states(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode astribot_msgs/RobotCartesianStates using dot-path selectors into named states."""
+    if not spec.names:
+        raise ValueError(
+            'astribot_msgs/RobotCartesianStates requires explicit selector names '
+            '(e.g. "states.0.pose.position.x")'
+        )
+    return np.asarray([dot_get(msg, name) for name in spec.names], dtype=np.float64)
+
+
+@register_decoder('astribot_msgs/msg/DoubleArray', dtype='float64')
+def _dec_astribot_double_array(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode astribot_msgs/DoubleArray — returns msg.data as a float64 vector."""
+    return np.asarray(msg.data, dtype=np.float64)
+
+
+@register_decoder('astribot_msgs/msg/RobotJointController', dtype='float64')
+def _dec_astribot_joint_controller(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode astribot_msgs/RobotJointController.
+
+    Without selector names: returns the full msg.command array.
+    With names that are positional labels (not found in msg.name): positional access.
+    With names that match real joint names in msg.name: name-based selection.
+    """
+    if not spec.names:
+        return np.asarray(msg.command, dtype=np.float64)
+
+    name_to_idx = {name: i for i, name in enumerate(msg.name)}
+    cmd = np.asarray(msg.command, dtype=np.float64)
+
+    # If spec.names are positional labels (not real joint names), use positional access
+    bare_names = [s.split('.', 1)[1] if '.' in s else s for s in spec.names]
+    if not msg.name or not all(n in name_to_idx for n in bare_names):
+        return cmd[:len(spec.names)]
+
+    out = []
+    for selector in spec.names:
+        field, joint_name = selector.split('.', 1) if '.' in selector else ('command', selector)
+        idx = name_to_idx[joint_name]
+        arr = getattr(msg, field)
+        out.append(float(arr[idx]))
+    return np.asarray(out, dtype=np.float64)
+
+
 # =============================================================================
 # IMU Decoder
 # =============================================================================

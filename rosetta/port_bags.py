@@ -174,7 +174,7 @@ def _build_features(specs: list[StreamSpec]) -> dict[str, dict[str, Any]]:
             # Numeric: aggregate names from all specs
             all_names = []
             for spec in key_specs:
-                all_names.extend(get_namespaced_names(spec))
+                all_names.extend(spec.names if spec.names else get_namespaced_names(spec))
             n = len(all_names) or 1
             features[key] = {
                 'dtype': dtype,
@@ -300,9 +300,15 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     storage_id = info.get('storage_identifier', 'mcap')
     prompt = _read_prompt(meta)
 
+    # Open storage file directly when available (avoids metadata.yaml format issues)
+    bag_files = list(bag_dir.glob(f'*.{storage_id}')) or list(bag_dir.glob('*.mcap'))
+    uri = str(bag_files[0]) if bag_files else str(bag_dir)
+    if bag_files:
+        storage_id = bag_files[0].suffix.lstrip('.')
+
     reader = rosbag2_py.SequentialReader()
     reader.open(
-        rosbag2_py.StorageOptions(uri=str(bag_dir), storage_id=storage_id),
+        rosbag2_py.StorageOptions(uri=uri, storage_id=storage_id),
         rosbag2_py.ConverterOptions(
             input_serialization_format='cdr',
             output_serialization_format='cdr',
@@ -426,7 +432,7 @@ def port_bags(
         robot_type=contract.robot_type,
         fps=contract.fps,
         features=features,
-        vcodec=vcodec,
+        encoding_kwargs={'vcodec': vcodec},
     )
 
     start_time = time.time()

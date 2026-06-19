@@ -503,3 +503,48 @@ def _enc_multidof_command(
             msg.values_dot.append(float(arr[values_dot_map[d]]))
 
     return msg
+
+
+# =============================================================================
+# Astribot Encoders
+# =============================================================================
+
+
+@register_encoder('astribot_msgs/msg/RobotJointController')
+def _enc_astribot_joint_controller(
+    action_vec: np.ndarray, spec: ActionStreamSpec, stamp_ns: int | None = None
+) -> Any:
+    """Encode to astribot_msgs/RobotJointController.
+
+    Without selector names: maps action vector to command[] with auto-generated joint names.
+    With names like ["command.joint_0"]: fills named joints in command[].
+    """
+    msg_cls = get_message('astribot_msgs/msg/RobotJointController')
+    msg = msg_cls()
+    _set_header_stamp(msg, stamp_ns)
+    msg.mode = 0
+
+    arr = _apply_clamp(np.asarray(action_vec, dtype=np.float64).flatten(), spec.clamp)
+
+    if not spec.names:
+        msg.name = [f'joint_{i}' for i in range(len(arr))]
+        msg.command = arr.tolist()
+        return msg
+
+    if len(spec.names) != len(arr):
+        raise ValueError(f'names length ({len(spec.names)}) != action length ({len(arr)})')
+
+    joint_order: list[str] = []
+    seen: set[str] = set()
+    command_map: dict[str, int] = {}
+
+    for i, path in enumerate(spec.names):
+        _, joint_name = path.split('.', 1) if '.' in path else ('command', path)
+        command_map[joint_name] = i
+        if joint_name not in seen:
+            joint_order.append(joint_name)
+            seen.add(joint_name)
+
+    msg.name = joint_order
+    msg.command = [float(arr[command_map[n]]) for n in joint_order]
+    return msg
