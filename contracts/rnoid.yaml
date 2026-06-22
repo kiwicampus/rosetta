@@ -87,6 +87,15 @@ observations:
     align: {strategy: hold, stamp: header}
     qos: {reliability: best_effort, history: keep_last, depth: 50}
 
+  # Chassis velocity: differentiated from full-rate (100Hz) chassis position data
+  - key: observation.state
+    topic: /astribot_chassis/joint_space_states
+    type: astribot_msgs/msg/RobotJointState
+    selector: {names: [chassis.j0.vel, chassis.j1.vel, chassis.j2.vel]}
+    derive: true
+    align: {strategy: hold, stamp: header}
+    qos: {reliability: best_effort, history: keep_last, depth: 50}
+
 actions:
   # Joint commands: right(7)+left(7)+head(2)+torso(4)+left_gripper(1)+right_gripper(1) = 22
   - key: action

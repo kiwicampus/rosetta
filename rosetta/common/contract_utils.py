@@ -394,6 +394,7 @@ def iter_observation_specs(contract: Contract) -> Iterable[ObservationStreamSpec
             'qos': o.qos,
             'decoder': o.decoder,
             'unit_conversion': o.unit_conversion,
+            'derive': o.derive,
         }
         items.append((o.topic, kwargs, o))
 
