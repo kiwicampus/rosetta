@@ -536,7 +536,8 @@ def port_bags(
         robot_type=contract.robot_type,
         fps=contract.fps,
         features=features,
-        encoding_kwargs={'vcodec': vcodec},
+        defer_video_encoding=False,
+        vcodec=vcodec,
     )
 
     start_time = time.time()
