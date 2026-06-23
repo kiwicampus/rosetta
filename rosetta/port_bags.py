@@ -176,6 +176,8 @@ def _build_features(specs: list[StreamSpec]) -> dict[str, dict[str, Any]]:
             features[key] = build_feature(first)
         else:
             # Numeric: aggregate names from all specs
+            if dtype == 'float64':
+                dtype = 'float32'
             all_names = []
             for spec in key_specs:
                 all_names.extend(spec.names if spec.names else get_namespaced_names(spec))
@@ -185,11 +187,6 @@ def _build_features(specs: list[StreamSpec]) -> dict[str, dict[str, Any]]:
                 'shape': (n,),
                 'names': all_names if all_names else None,
             }
-
-    # Frame boundary markers
-    features['is_first'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
-    features['is_last'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
-    features['is_terminal'] = {'dtype': 'bool', 'shape': (1,), 'names': None}
 
     return features
 
@@ -274,7 +271,7 @@ def _precompute_derivatives(
 # Map LeRobot dtype strings to numpy dtypes
 DTYPE_MAP = {
     'float32': np.float32,
-    'float64': np.float64,
+    'float64': np.float32,  # normalize to float32 (lerobot convention)
     'int32': np.int32,
     'int64': np.int64,
     'bool': bool,
@@ -428,24 +425,13 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
     current_tick_idx = 0
     current_tick_ns = start_ns
     header_warned: set[str] = set()
+    filled_topics: set[str] = set()
+    required_topics: set[str] = set(buffers.keys())
 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
 
-        # Emit frames whose tick time has passed
-        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
-            frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
-            frame['is_first'] = np.array([current_tick_idx == 0], dtype=bool)
-            frame['is_last'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-            frame['is_terminal'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-            frame['task'] = prompt
-
-            yield frame
-
-            current_tick_idx += 1
-            current_tick_ns = start_ns + current_tick_idx * step_ns
-
-        # Push message to buffer
+        # Push first so the triggering message is available when we sample
         if topic in buffers:
             spec, buffer = buffers[topic]
             msg = deserialize_message(data, get_message(spec.msg_type))
@@ -461,15 +447,22 @@ def _stream_frames_from_bag(bag_dir: Path, specs: list[StreamSpec]):
             val = decode_value(msg, spec)
             if val is not None:
                 buffer.push(ts, val)
+                filled_topics.add(topic)
 
-    # Emit remaining frames
+        # Emit frames whose tick time has passed; skip silently during warmup
+        all_warm = required_topics.issubset(filled_topics)
+        while current_tick_idx < n_frames and bag_ns >= current_tick_ns:
+            if all_warm:
+                frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
+                frame['task'] = prompt
+                yield frame
+            current_tick_idx += 1
+            current_tick_ns = start_ns + current_tick_idx * step_ns
+
+    # Emit remaining frames (all buffers warm by this point)
     while current_tick_idx < n_frames:
         frame = _sample_frame(current_tick_ns, buffers, deriv_specs, derivatives)
-        frame['is_first'] = np.array([current_tick_idx == 0], dtype=bool)
-        frame['is_last'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
-        frame['is_terminal'] = np.array([current_tick_idx == n_frames - 1], dtype=bool)
         frame['task'] = prompt
-
         yield frame
 
         current_tick_idx += 1
