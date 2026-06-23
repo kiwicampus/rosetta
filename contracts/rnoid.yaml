@@ -140,5 +140,12 @@ actions:
       type: astribot_msgs/msg/RobotJointController
       qos: {reliability: best_effort, history: keep_last, depth: 10}
 
+  - key: action
+    selector: {names: [chassis.j0.vel, chassis.j1.vel, chassis.j2.vel]}
+    publish:
+      topic: /astribot_chassis/joint_space_command
+      type: astribot_msgs/msg/RobotJointController
+      qos: {reliability: best_effort, history: keep_last, depth: 50}
+
 recording:
   storage: mcap
