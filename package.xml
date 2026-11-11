@@ -21,6 +21,7 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>foxglove_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>control_msgs</exec_depend>
@@ -32,6 +33,7 @@
   <test_depend>ament_cmake_flake8</test_depend>
   <test_depend>ament_cmake_lint_cmake</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_cmake_ros</test_depend>
   <test_depend>launch</test_depend>
   <test_depend>launch_ros</test_depend>

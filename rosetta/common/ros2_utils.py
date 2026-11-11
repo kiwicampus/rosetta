@@ -267,7 +267,7 @@ def dot_set(obj, path: str, value: float) -> None:
 
 def stamp_from_header_ns(msg) -> int | None:
     """
-    Extract nanosecond timestamp from a ROS message header.
+    Extract nanosecond timestamp from a ROS message header, or from foxglove's `timestamp`.
 
     Returns
     -------
@@ -277,7 +277,10 @@ def stamp_from_header_ns(msg) -> int | None:
     try:
         st = msg.header.stamp
     except AttributeError:
-        return None
+        # foxglove_msgs carry the stamp as a top level `timestamp`.
+        st = getattr(msg, 'timestamp', None)
+        if st is None:
+            return None
 
     try:
         sec = int(st.sec)

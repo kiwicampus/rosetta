@@ -15,7 +15,8 @@ segment, so one seek plus a forward walk suffices; and ``hold`` resampling makes
 rows share a log time, so a frame is decoded once and emitted as often as the plan repeats it.
 
 Implements the ``streaming_encoder`` interface ``DatasetWriter`` expects, the same hook the
-HDF5 encoder uses.
+HDF5 encoder uses. H.264 cameras (``BagCameraPlan.passthrough``) are copied by
+``h264_passthrough`` instead of being decoded and encoded.
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ import av
 import cv2
 import numpy as np
 from mcap.reader import make_reader
+
+from . import h264_passthrough
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +74,12 @@ class BagCameraPlan:
 
     Attributes:
         video_key: LeRobot feature key, e.g. ``observation.images.head_rgbd``.
-        topic: MCAP topic carrying this camera's CompressedImage messages.
+        topic: MCAP topic carrying this camera's CompressedImage or CompressedVideo messages.
         log_times: Per output row, the log time of the message to use. Non-decreasing;
             repeats where ``hold`` resampling reuses a frame.
         width: Output width after the contract's resize.
         height: Output height after the contract's resize.
+        passthrough: The topic carries H.264 that is copied into the MP4, not re-encoded.
     """
 
     video_key: str
@@ -83,6 +87,7 @@ class BagCameraPlan:
     log_times: np.ndarray
     width: int
     height: int
+    passthrough: bool = False
 
     @property
     def num_rows(self) -> int:
@@ -361,10 +366,34 @@ def _encode_segment_impl(
     return out_path, frames_written, stats_images
 
 
+def _remux_h264(
+    mcap_path: str, plan: BagCameraPlan, segment: _Segment, out_path: str, fps: int
+) -> Tuple[str, int, List[np.ndarray]]:
+    """Copy one camera's H.264 packets into an MP4 along the plan. Runs in a worker process."""
+    try:
+        video = h264_passthrough.write_episode_video(
+            mcap_path, plan.topic, plan.log_times, out_path, fps,
+            (plan.height, plan.width), segment.stats_rows,
+        )
+    except Exception as exc:  # noqa: BLE001, flattened for the pool as in _encode_segment
+        raise RuntimeError(f"{plan.video_key} passthrough: {type(exc).__name__}: {exc}") from None
+    logger.info(
+        "%s: copied %d packets into %d rows, %d skip frames, max lag %d frames",
+        plan.video_key, video.packets_copied, video.rows, video.skip_frames, video.max_lag,
+    )
+    return out_path, video.rows, video.stats_images
+
+
 def _count_packets(path: Path) -> int:
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
         return sum(1 for p in container.demux(stream) if p.dts is not None)
+
+
+def _first_pts(path: Path) -> int:
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        return next(p.pts for p in container.demux(stream) if p.pts is not None)
 
 
 class PlannedBagVideoEncoder:
@@ -391,7 +420,8 @@ class PlannedBagVideoEncoder:
         self._fps = int(fps)
         self._vcodec = vcodec
         self._pix_fmt = pix_fmt
-        self._codec_options = dict(codec_options or {})
+        # Fragmented MP4 has no edit list, so B-frame reorder delay would offset every pts.
+        self._codec_options = {**(codec_options or {}), "bf": "0"}
         self._target_units = int(target_units)
         self._max_concurrent = max(1, int(max_concurrent))
         self._decode_threads = max(1, int(decode_threads))
@@ -444,7 +474,14 @@ class PlannedBagVideoEncoder:
 
         # lerobot's own sampling, so the stats match the non-streaming path row for row.
         stats_rows = sample_indices(self._num_rows) if self._num_rows >= 2 else []
-        segments = plan_segments(self._plans, self._target_units, stats_rows)
+        encoded = [p for p in self._plans if not p.passthrough]
+        segments = plan_segments(encoded, self._target_units, stats_rows)
+        # A copy is I/O bound and its packet plan spans the episode, so it is never split.
+        segments += [
+            _Segment(p.video_key, 0, 0, p.num_rows, tuple(stats_rows))
+            for p in self._plans
+            if p.passthrough
+        ]
         by_key = {p.video_key: p for p in self._plans}
 
         # fork, not spawn: spawn re-imports __main__ and drags torch and lerobot into each worker.
@@ -455,6 +492,13 @@ class PlannedBagVideoEncoder:
         self._futures = {}
         for segment in segments:
             out = self._temp_dir / f"{segment.video_key}_{segment.index:03d}.mp4"
+            plan = by_key[segment.video_key]
+            if plan.passthrough:
+                future = self._pool.submit(
+                    _remux_h264, self._mcap_path, plan, segment, str(out), self._fps
+                )
+                self._futures[future] = segment
+                continue
             future = self._pool.submit(
                 _encode_segment,
                 self._mcap_path,
@@ -529,6 +573,9 @@ class PlannedBagVideoEncoder:
                     f"{plan.video_key}: encoded video holds {stored} frames but the episode "
                     f"has {plan.num_rows} rows"
                 )
+            start = _first_pts(final)
+            if start != 0:
+                raise RuntimeError(f"{plan.video_key}: encoded video starts at pts {start}, not 0")
             ordered_samples = [
                 image
                 for index in sorted(samples[plan.video_key])

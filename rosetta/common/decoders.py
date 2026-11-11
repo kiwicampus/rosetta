@@ -262,6 +262,14 @@ def _dec_compressed_image(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
     return img.astype(np.uint8)
 
 
+@register_decoder('foxglove_msgs/msg/CompressedVideo', dtype='video')
+def _dec_compressed_video(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Registers H.264 as video; a lone P frame has no picture to decode to."""
+    raise NotImplementedError(
+        f'{spec.key}: H.264 frames are copied by port_bags, not decoded one message at a time'
+    )
+
+
 # =============================================================================
 # JointState Decoder
 # =============================================================================

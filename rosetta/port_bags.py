@@ -78,11 +78,14 @@ from .common.converters import decode_value, DTYPES, get_decoder_dtype
 from .bag_video_encoder import BagCameraPlan, PlannedBagVideoEncoder
 from .common.ros2_utils import get_message_timestamp_ns
 from .common.stamp_guard import StampMonotonicityGuard
+from .h264_passthrough import MSG_TYPE as COMPRESSED_VIDEO, StartGate
 
 # Bag metadata keys
 BAG_METADATA_KEY = 'rosbag2_bagfile_information'
 BAG_CUSTOM_DATA_KEY = 'custom_data'
 BAG_PROMPT_KEY = 'lerobot.operator_prompt'
+
+COMPRESSED_IMAGE = 'sensor_msgs/msg/CompressedImage'
 
 
 def _resolve_msg_format(raw_format: str) -> str | None:
@@ -469,6 +472,7 @@ def _stream_frames_from_bag(
     prompt: str = '',
     plan_video: bool = False,
     max_stamp_backward_jump_s: float = 0.0,
+    h264_gates: dict[str, StartGate] | None = None,
 ):
     """
     Stream LeRobot frames from a bag file.
@@ -477,6 +481,7 @@ def _stream_frames_from_bag(
     Specs sharing the same key are aggregated into single tensors.
     Header stamped streams are guarded against backward stamp jumps
     (see StampMonotonicityGuard); a negative tolerance disables that.
+    h264_gates, when given, receives the StartGate of each H.264 key.
     """
     fps = specs[0].fps
     step_ns = int(1e9 / fps)
@@ -517,6 +522,8 @@ def _stream_frames_from_bag(
     filled_topics: set[str] = set()
     required_topics: set[str] = set(buffers.keys())
     key_formats: dict[str, str] = {}  # output key -> format string (e.g. 'jpeg', 'png')
+    # H.264 topics count from their first IDR: nothing before it decodes.
+    gates: dict[str, StartGate] = {} if h264_gates is None else h264_gates
 
     while reader.has_next():
         topic, data, bag_ns = reader.read_next()
@@ -545,7 +552,14 @@ def _stream_frames_from_bag(
             if spec.stamp_src == 'header':
                 stamp_guard.check(topic, spec.key, ts)
             if isinstance(spec, ObservationStreamSpec) and spec.is_image:
-                if spec.msg_type == 'sensor_msgs/msg/CompressedImage':
+                if spec.msg_type == COMPRESSED_VIDEO:
+                    if not plan_video:
+                        raise RuntimeError(f'{spec.key}: H.264 topics need the planned video path')
+                    gate = gates.setdefault(spec.key, StartGate(spec.key))
+                    if gate.accept(int(bag_ns), bytes(msg.data)):
+                        buffer.push(ts, int(bag_ns))
+                        filled_topics.add(topic)
+                elif spec.msg_type == COMPRESSED_IMAGE:
                     # Push raw bytes — lerobot sniffs the format from the bytes
                     # unless we resolve a codec name from msg.format below.
                     raw = bytes(msg.data)
@@ -655,9 +669,11 @@ def port_bags(
         for spec in specs
         if isinstance(spec, ObservationStreamSpec)
         and spec.is_image
-        and spec.msg_type == 'sensor_msgs/msg/CompressedImage'
+        and spec.msg_type in (COMPRESSED_IMAGE, COMPRESSED_VIDEO)
         and spec.image_resize
     ]
+    if not fast_video and any(s.msg_type == COMPRESSED_VIDEO for s in image_specs_for_plan):
+        raise ValueError('H.264 topics are copied by the planned video path; drop --no-fast-video')
     video_encoder = None
     if fast_video and image_specs_for_plan:
         video_encoder = PlannedBagVideoEncoder(
@@ -701,7 +717,7 @@ def port_bags(
         if isinstance(spec, ObservationStreamSpec)
         and spec.is_image
         and spec.image_resize
-        and spec.msg_type == 'sensor_msgs/msg/CompressedImage'
+        and spec.msg_type == COMPRESSED_IMAGE
     ]
     actual_sizes = (
         _peek_compressed_image_sizes(bag_dirs[0], compressed_image_specs)
@@ -751,14 +767,35 @@ def port_bags(
 
                 if video_encoder is not None:
                     rows: list[dict] = []
+                    h264_gates: dict[str, StartGate] = {}
                     for frame, _fmts in _stream_frames_from_bag(
                         bag_dir,
                         specs,
                         prompt=episode_prompt,
                         plan_video=True,
                         max_stamp_backward_jump_s=max_stamp_backward_jump_s,
+                        h264_gates=h264_gates,
                     ):
                         rows.append(frame)
+                    # An H.264 camera starts on an IDR: start on the first row by which every one
+                    # has received an IDR; the others start from their previous IDR, behind.
+                    video_keys_h264 = [
+                        s.key for s in image_specs_for_plan if s.msg_type == COMPRESSED_VIDEO
+                    ]
+                    if rows and video_keys_h264:
+                        missing = [k for k in video_keys_h264 if k not in h264_gates]
+                        if missing:
+                            raise RuntimeError(f'{missing}: topic not in {bag_dir.name}')
+                        first_row = max(
+                            h264_gates[k].first_start_row([r[k] for r in rows])
+                            for k in video_keys_h264
+                        )
+                        if first_row:
+                            logging.info(
+                                '  starting on row %d, the first by which every H.264 camera '
+                                'has received an IDR', first_row
+                            )
+                            del rows[:first_row]
                     frame_count = len(rows)
                     if frame_count == 0:
                         raise RuntimeError(f'No frames produced for {bag_dir.name}')
@@ -766,9 +803,11 @@ def port_bags(
                     plans = []
                     for spec in image_specs_for_plan:
                         times = [r.get(spec.key) for r in rows]
-                        if any(t is None for t in times):
+                        # A row with no message holds None, or zeros when a stamp ran ahead.
+                        empty = sum(not isinstance(t, (int, np.integer)) for t in times)
+                        if empty:
                             raise RuntimeError(
-                                f'{spec.key}: {sum(t is None for t in times)} of {frame_count} '
+                                f'{spec.key}: {empty} of {frame_count} '
                                 f'rows have no message in {bag_dir.name}'
                             )
                         height, width = (
@@ -781,6 +820,7 @@ def port_bags(
                                 log_times=np.asarray(times, dtype=np.int64),
                                 width=width,
                                 height=height,
+                                passthrough=spec.msg_type == COMPRESSED_VIDEO,
                             )
                         )
 

@@ -50,6 +50,10 @@ if(BUILD_TESTING)
   list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_xmllint)
   ament_lint_auto_find_test_dependencies()
 
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_h264 test/test_h264.py TIMEOUT 120)
+  ament_add_pytest_test(test_h264_passthrough test/test_h264_passthrough.py TIMEOUT 120)
+
   # Integration tests with launch_testing
   find_package(ament_cmake_ros REQUIRED)
   find_package(launch_testing_ament_cmake REQUIRED)

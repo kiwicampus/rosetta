@@ -763,6 +763,7 @@ names: [twist.twist.linear.x, pose.pose.position.z]
 | `sensor_msgs/msg/JointState` | position, velocity, effort by joint name |
 | `sensor_msgs/msg/Image` | RGB uint8 array |
 | `sensor_msgs/msg/CompressedImage` | Decoded to RGB uint8 |
+| `foxglove_msgs/msg/CompressedVideo` | H.264 copied into the episode MP4 by `port_bags` only (see [H.264 cameras](#h264-cameras)) |
 | `geometry_msgs/msg/Twist` | linear.xyz, angular.xyz |
 | `nav_msgs/msg/Odometry` | pose, twist fields |
 | `sensor_msgs/msg/Joy` | axes, buttons arrays |
@@ -774,6 +775,16 @@ names: [twist.twist.linear.x, pose.pose.position.z]
 | `std_msgs/msg/Float64MultiArray` | Vector float64 |
 
 The dtype is auto-detected from the message type. You can override it with the `dtype` field in the contract, or use a custom decoder for non-standard types.
+
+### H.264 cameras
+
+A camera recorded as H.264 (`foxglove_msgs/msg/CompressedVideo`, format `h264`) is copied into the episode MP4 without decoding or encoding a frame. Resampling still uses the contract's `align`, with two differences forced by H.264, where a P frame is only a difference against the frame before it:
+
+- A row that repeats the previous message gets a skip frame: a tiny frame that decodes to an exact copy of the previous picture.
+- Where hold resampling would skip a message, the camera advances one packet per row instead and falls a frame further behind for each such tick. It catches up on the next repeat, or by jumping forward to the next IDR.
+- The episode starts on the first row by which every H.264 camera has received an IDR; the other cameras start from their previous IDR and run behind until they catch up.
+
+The stream must be Annex B with SPS and PPS on every IDR, no B frames, every P frame a reference, and POC type 0 or 2 (x264 without B frames uses 2). Its resolution must equal `image.resize`, since nothing is resized. Image statistics decode only the IDR nearest each sampled row. This path needs the default planned video encoder (it refuses `--no-fast-video`), and live inference cannot decode single H.264 messages.
 
 ### Custom Encoders/Decoders (Experimental)
 
@@ -1061,6 +1072,7 @@ In the Rosetta contract, dtype is usually **auto-detected** from the ROS2 messag
 |-------------------|-----------|--------|
 | `sensor_msgs/msg/JointState` | `float64` | Selected position/velocity/effort values |
 | `sensor_msgs/msg/CompressedImage` | `video` | RGB uint8 `(H, W, 3)` |
+| `foxglove_msgs/msg/CompressedVideo` | `video` | H.264 packets, copied as is |
 | `sensor_msgs/msg/Image` | `video` | RGB uint8 `(H, W, 3)` |
 | `geometry_msgs/msg/Twist` | `float64` | Selected linear/angular components |
 | `nav_msgs/msg/Odometry` | `float64` | Selected pose/twist fields |
